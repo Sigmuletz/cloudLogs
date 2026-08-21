@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cloudlogs</title>
+<!-- Assets are loaded relative to the page. If the static dir is mounted at
+     /static instead of /, the onerror fallback picks up the other path. -->
+<link rel="stylesheet" href="static/style.css"
+      onerror="this.remove();var l=document.createElement('link');l.rel='stylesheet';l.href='style.css';document.head.appendChild(l);">
+</head>
+<body>
+
+<div id="app">
+
+  <!-- ── left: filter panel ───────────────────────────────────────────── -->
+  <aside id="panel" class="panel">
+    <div class="panel-head">
+      <input id="q" class="input" type="text" placeholder="search all logs…" data-fk="q" autocomplete="off">
+      <button id="panel-hide" class="icon-btn" title="Hide filter panel">&#x2039;</button>
+    </div>
+    <div class="panel-actions">
+      <button id="add-filter" class="btn">+ Add filter</button>
+      <button id="reload" class="icon-btn" title="Refetch">&#x21bb;</button>
+    </div>
+    <div id="cards" class="cards"></div>
+    <div class="panel-foot">
+      <button id="clear-filters" class="btn btn-quiet">Clear filters</button>
+      <button id="reset-layout" class="btn btn-quiet">Reset layout</button>
+    </div>
+  </aside>
+
+  <!-- drag to resize the filter panel; double-click restores the default -->
+  <div id="panel-grip" class="grip" title="Drag to resize · double-click to reset"></div>
+
+  <!-- ── main: toolbar + table ────────────────────────────────────────── -->
+  <main id="main">
+    <!-- ── query bar: Lucene-style expression over every column ────────── -->
+    <div id="qbar" class="qbar">
+      <textarea id="lq" class="lq" rows="2" spellcheck="false" autocomplete="off"
+                placeholder="level:(WARN OR ERROR) AND service:ram AND req_duration_ms:>=100 &#10;Ctrl+Enter to run · drag the bottom edge to resize"></textarea>
+      <div class="qbar-side">
+        <button id="lq-run" class="btn btn-run" title="Run query (Ctrl+Enter)">Run</button>
+        <button id="lq-clear" class="btn btn-quiet" title="Clear the query">Clear</button>
+        <button id="lq-help" class="btn btn-quiet" title="Query syntax">?</button>
+      </div>
+    </div>
+    <div id="lq-error" class="lq-error" hidden></div>
+
+    <div id="topbar">
+      <button id="panel-show" class="icon-btn" title="Show filter panel">&#x203a;</button>
+      <span id="count" class="count">…</span>
+      <span id="spinner" class="spinner" hidden></span>
+      <span class="spacer"></span>
+      <button id="tz-btn" class="btn">tz: Local &#x25be;</button>
+      <button id="cols-btn" class="btn">columns &#x25be;</button>
+    </div>
+
+    <!-- says in words that rows are being highlighted, not filtered -->
+    <div id="hlbar" class="hlbar" hidden></div>
+
+    <div id="error" class="error" hidden></div>
+
+    <div id="tablewrap">
+      <table id="logtable">
+        <colgroup id="cg"></colgroup>
+        <thead><tr id="hrow"></tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+      <div id="tablefoot" class="tablefoot"></div>
+    </div>
+  </main>
+
+  <!-- drag to resize the detail drawer; double-click restores the default -->
+  <div id="drawer-grip" class="grip" title="Drag to resize · double-click to reset" hidden></div>
+
+  <!-- ── right: detail drawer ─────────────────────────────────────────── -->
+  <aside id="drawer" class="drawer" hidden>
+    <div class="drawer-head">
+      <span class="drawer-title">Record</span>
+      <button id="drawer-close" class="icon-btn" title="Close">&#x2715;</button>
+    </div>
+    <div id="drawer-body" class="drawer-body"></div>
+  </aside>
+
+</div>
+
+<script src="static/app.js"
+        onerror="var s=document.createElement('script');s.src='app.js';document.body.appendChild(s);"></script>
+</body>
+</html>
