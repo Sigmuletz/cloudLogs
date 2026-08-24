@@ -61,6 +61,16 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
+# Run directly as a file -- `python3 cloudlogs/main.py` -- and Python puts this
+# file's own directory on sys.path, not the project root, so the package cannot
+# import itself. Put the root back before the first package import.
+if __package__ in (None, ""):  # pragma: no cover - only on a direct script run
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+    __package__ = "cloudlogs"
+
 from cloudlogs import lucene, query
 
 try:  # ingest.py is written by another stage; never fatal at import time

@@ -39,8 +39,25 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from .parse import parse_record
-from .rules import ENGINE_COLUMNS, Column, Ruleset, RulesError, find_rules_path, load_rules
+# Run directly as a file -- `python3 cloudlogs/main.py` -- and Python puts this
+# file's own directory on sys.path, not the project root, so the package cannot
+# import itself. Put the root back before the first package import.
+if __package__ in (None, ""):  # pragma: no cover - only on a direct script run
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+    __package__ = "cloudlogs"
+
+from cloudlogs.parse import parse_record
+from cloudlogs.rules import (
+    ENGINE_COLUMNS,
+    Column,
+    Ruleset,
+    RulesError,
+    find_rules_path,
+    load_rules,
+)
 
 DEFAULT_OUT = Path("data/logs.json")
 COLUMNS_NAME = "columns.json"

@@ -636,9 +636,11 @@ python -m cloudlogs.main app.log -p 9000 --host 127.0.0.1
 python -m cloudlogs.main app.log --rules my.yaml --data /tmp/out.json --reload
 ```
 
-`python -m` needs the package on the import path, so run it from the project
-root, or `pip install -e .` once — which also installs a bare `cloudlogs`
-command that works from anywhere.
+`python cloudlogs/main.py app.log` works too: run as a file, Python would put
+`cloudlogs/` rather than the project root on `sys.path`, so both entry points
+put the root back before importing the package. `python -m` needs the package
+importable, so run it from the project root — or `pip install -e .` once, which
+also installs a bare `cloudlogs` command that works from anywhere.
 
 Paths given on the command line are resolved against the directory you ran the
 script in, not the project root, and they override `CLOUDLOGS_INPUT`.
