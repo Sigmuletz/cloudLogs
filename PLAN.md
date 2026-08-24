@@ -429,6 +429,12 @@ Vanilla JS + CSS. No npm, no bundler, no framework. Dark theme.
 * Default columns: `time`, `level`, `service`, `k8s_namespace`, `logger`,
   `req_status_code`, `message` (message takes remaining width).
 * **Resize**: mousedown on a `<th>` divider, drag; width persisted per column.
+* **Fit to contents**: double-click a divider and the column takes the width of
+  its widest loaded value, so a long one is read by scrolling right instead of
+  being clipped to an ellipsis (`message` in the sample fits at ~2900px).
+  Shift-double-click restores the column's default width. Measurement runs over
+  the cells in the DOM — every loaded row is there, the table is not
+  virtualised — with each column's own font, and is clamped to 4000px.
 * **Reorder**: HTML5 drag-and-drop on headers, drop indicator between columns.
 * **Sort**: click cycles asc → desc → off; shift-click appends a key with a
   `¹²³` precedence badge. Server-side; scroll resets to top.

@@ -34,7 +34,12 @@ from cloudlogs.parse import parse_line, parse_record  # noqa: E402
 from cloudlogs.rules import load_rules  # noqa: E402
 
 SOURCE = "test.log"
+#: the live config -- edited freely by whoever runs cloudlogs; only checked for
+#: "does it still load"
 SHIPPED = ROOT / "rules.yaml"
+#: the frozen ruleset as originally shipped. The behavioural tests below assert
+#: how THAT file parses, so adding a rule to rules.yaml is never a test failure.
+MIGRATION = ROOT / "tests" / "migration_rules.yaml"
 
 OP_LOG = (
     "2026-07-09 08:25:06 WARN  [OperationLogInterceptor.filter:44] "
@@ -721,18 +726,24 @@ def test_format_summary_separates_a_dead_rule_from_an_unused_fallback() -> None:
 
 
 # --------------------------------------------------------------------------
-# the shipped rules.yaml -- the file, not the engine
+# the ruleset as a file, not the engine
+#
+# `test_live_rules_load` guards the config actually in use: whatever has been
+# added to rules.yaml, it must still parse. Everything after it asserts the
+# behaviour of the frozen migration ruleset, so editing rules.yaml -- the whole
+# point of the file -- never shows up here as a regression.
 # --------------------------------------------------------------------------
 
 
-def test_shipped_rules_load():
+def test_live_rules_load():
+    """Whatever is in rules.yaml right now, it loads and validates."""
     ruleset = load_rules(SHIPPED)
     assert [c.name for c in ruleset.output_columns][:3] == ["time", "app_time", "level"]
     assert [c.name for c in ruleset.columns if c.internal] == ["origin", "pipe_body"]
 
 
 def test_shipped_rules_split_an_operation_log():
-    ruleset = load_rules(SHIPPED)
+    ruleset = load_rules(MIGRATION)
     record = parse_line(double_encoded({"log": OP_LOG}), SOURCE, ruleset)
     assert record["level"] == "WARN"
     assert (record["logger"], record["method"], record["src_line"]) == (
@@ -752,7 +763,7 @@ def test_shipped_rules_split_an_operation_log():
 
 def test_shipped_rules_ignore_pipe_labels_in_ordinary_prose():
     """497 plain messages mention `x-request-id:`; none of them is a request log."""
-    ruleset = load_rules(SHIPPED)
+    ruleset = load_rules(MIGRATION)
     prose = (
         "2026-07-09 08:25:06 INFO  [Ctx.log:1] (main) "
         "received response code: 200 for x-request-id: abc on path: /v3/x"
@@ -765,7 +776,7 @@ def test_shipped_rules_ignore_pipe_labels_in_ordinary_prose():
 
 
 def test_shipped_rules_derive_service_from_the_container():
-    ruleset = load_rules(SHIPPED)
+    ruleset = load_rules(MIGRATION)
 
     def service(container):
         envelope = {"log": PLAIN_LOG, "kubernetes": {"container_name": container}}
@@ -783,7 +794,7 @@ def test_shipped_rules_derive_service_from_the_container():
 
 @pytest.mark.parametrize("prefix", ["ram", "information"])
 def test_shipped_rules_prefer_the_envelope_over_the_pipe_fields(prefix):
-    ruleset = load_rules(SHIPPED)
+    ruleset = load_rules(MIGRATION)
     envelope = {
         "log": OP_LOG,
         f"{prefix}_path": "/v3/from-envelope",

@@ -991,7 +991,10 @@ function renderHeader() {
       if (state.sort.length > 1) th.appendChild(el('span', 'sort-ord', SUP[si + 1] || String(si + 1)));
     }
 
-    th.appendChild(el('div', 'rz'));
+    var grip = el('div', 'rz');
+    grip.title = 'drag to resize  ·  double-click to fit contents  ·  ' +
+      'shift-double-click to reset';
+    th.appendChild(grip);
     hrow.appendChild(th);
   });
 
@@ -1597,6 +1600,15 @@ function installHeaderInteractions() {
     e.preventDefault();
     startResize(th, e.clientX);
   });
+
+  hrow.addEventListener('dblclick', function (e) {
+    if (!e.target.classList || !e.target.classList.contains('rz')) return;
+    var th = e.target.closest('th');
+    if (!th) return;
+    e.preventDefault();
+    suppressClick = true;                      // never sort on a divider gesture
+    fitColumn(th, e.shiftKey);
+  });
 }
 
 /* Drag a grip to resize the panel it sits next to. The filter panel grows to
@@ -1675,6 +1687,53 @@ function moveColumn(src, target, after) {
   saveLayout();
   renderHeader();
   renderRows(0);
+}
+
+/* Double-click a divider to size that column to its widest loaded value, so a
+   long one can be read in full by scrolling right instead of being clipped to
+   an ellipsis. Shift-double-click puts the column back to its default width.
+
+   Measurement runs over the cells actually in the DOM (every loaded row is,
+   the table is not virtualised) using a canvas with each column's own font --
+   `message` and `time` are monospace, the rest are not. */
+var WIDTH_FIT_MAX = 4000;
+
+function fitColumn(th, reset) {
+  var name = th.dataset.col;
+  var idx = Array.prototype.indexOf.call(th.parentNode.children, th);
+
+  if (reset) {
+    delete state.layout.widths[name];
+    saveLayout();
+    renderHeader();
+    return;
+  }
+
+  var canvas = fitColumn._canvas || (fitColumn._canvas = document.createElement('canvas'));
+  var ctx = canvas.getContext('2d');
+  var cells = $('tbody').querySelectorAll('tr > td:nth-child(' + (idx + 1) + ')');
+  var widest = 0, pad = 16;
+
+  if (cells.length) {
+    var cs = getComputedStyle(cells[0]);
+    ctx.font = cs.fontWeight + ' ' + cs.fontSize + ' ' + cs.fontFamily;
+    pad = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight) + 2;
+    for (var i = 0; i < cells.length; i++) {
+      var w = ctx.measureText(cells[i].textContent || '').width;
+      if (w > widest) widest = w;
+    }
+  }
+
+  // the header has to fit too: its label, any sort marks, and the grip
+  var hs = getComputedStyle(th);
+  ctx.font = hs.fontWeight + ' ' + hs.fontSize + ' ' + hs.fontFamily;
+  var head = ctx.measureText(th.textContent || '').width +
+    parseFloat(hs.paddingLeft) + parseFloat(hs.paddingRight) + 12;
+
+  var want = Math.ceil(Math.max(widest + pad, head));
+  state.layout.widths[name] = Math.max(WIDTH_MIN, Math.min(WIDTH_FIT_MAX, want));
+  saveLayout();
+  renderHeader();
 }
 
 function startResize(th, startX) {
