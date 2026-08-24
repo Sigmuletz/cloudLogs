@@ -3,7 +3,7 @@
     "name": "time",
     "kind": "time",
     "label": "Time",
-    "distinct": 529,
+    "distinct": 468,
     "numeric": false,
     "default_visible": true,
     "default_filter": false
@@ -12,7 +12,7 @@
     "name": "app_time",
     "kind": "time",
     "label": "App Time",
-    "distinct": 6,
+    "distinct": 10,
     "numeric": false,
     "default_visible": false,
     "default_filter": false
@@ -21,7 +21,7 @@
     "name": "level",
     "kind": "facet",
     "label": "Level",
-    "distinct": 4,
+    "distinct": 6,
     "numeric": false,
     "default_visible": true,
     "default_filter": true
@@ -30,7 +30,7 @@
     "name": "logger",
     "kind": "facet",
     "label": "Logger",
-    "distinct": 28,
+    "distinct": 40,
     "numeric": false,
     "default_visible": true,
     "default_filter": true
@@ -39,7 +39,7 @@
     "name": "method",
     "kind": "facet",
     "label": "Method",
-    "distinct": 42,
+    "distinct": 56,
     "numeric": false,
     "default_visible": false,
     "default_filter": false
@@ -48,7 +48,7 @@
     "name": "src_line",
     "kind": "number",
     "label": "Source Line",
-    "distinct": 68,
+    "distinct": 87,
     "numeric": true,
     "default_visible": false,
     "default_filter": false
@@ -57,7 +57,7 @@
     "name": "thread",
     "kind": "facet",
     "label": "Thread",
-    "distinct": 135,
+    "distinct": 129,
     "numeric": false,
     "default_visible": false,
     "default_filter": false
@@ -66,7 +66,7 @@
     "name": "message",
     "kind": "text",
     "label": "Message",
-    "distinct": 286,
+    "distinct": 369,
     "numeric": false,
     "default_visible": true,
     "default_filter": false
@@ -84,7 +84,7 @@
     "name": "req_path",
     "kind": "facet",
     "label": "Req Path",
-    "distinct": 6,
+    "distinct": 18,
     "numeric": false,
     "default_visible": false,
     "default_filter": false
@@ -93,7 +93,7 @@
     "name": "req_status_code",
     "kind": "facet",
     "label": "Req Status Code",
-    "distinct": 6,
+    "distinct": 5,
     "numeric": true,
     "default_visible": true,
     "default_filter": true
@@ -102,7 +102,7 @@
     "name": "req_duration_ms",
     "kind": "number",
     "label": "Req Duration (ms)",
-    "distinct": 42,
+    "distinct": 38,
     "numeric": true,
     "default_visible": false,
     "default_filter": false
@@ -111,7 +111,7 @@
     "name": "req_host",
     "kind": "facet",
     "label": "Req Host",
-    "distinct": 25,
+    "distinct": 28,
     "numeric": false,
     "default_visible": false,
     "default_filter": false
@@ -120,7 +120,7 @@
     "name": "req_user_agent",
     "kind": "facet",
     "label": "Req User Agent",
-    "distinct": 4,
+    "distinct": 5,
     "numeric": false,
     "default_visible": false,
     "default_filter": false
@@ -156,7 +156,7 @@
     "name": "k8s_cluster",
     "kind": "facet",
     "label": "K8s Cluster",
-    "distinct": 2,
+    "distinct": 4,
     "numeric": false,
     "default_visible": false,
     "default_filter": false
@@ -165,7 +165,7 @@
     "name": "k8s_namespace",
     "kind": "facet",
     "label": "K8s Namespace",
-    "distinct": 24,
+    "distinct": 25,
     "numeric": false,
     "default_visible": true,
     "default_filter": true
@@ -183,7 +183,7 @@
     "name": "k8s_container",
     "kind": "facet",
     "label": "K8s Container",
-    "distinct": 25,
+    "distinct": 26,
     "numeric": false,
     "default_visible": false,
     "default_filter": false
@@ -192,7 +192,7 @@
     "name": "k8s_pod_hash",
     "kind": "facet",
     "label": "K8s Pod Hash",
-    "distinct": 26,
+    "distinct": 29,
     "numeric": false,
     "default_visible": false,
     "default_filter": false
@@ -210,7 +210,7 @@
     "name": "k8s_revision",
     "kind": "facet",
     "label": "K8s Revision",
-    "distinct": 3,
+    "distinct": 4,
     "numeric": false,
     "default_visible": false,
     "default_filter": false
@@ -219,7 +219,7 @@
     "name": "k8s_deployment_id",
     "kind": "facet",
     "label": "K8s Deployment ID",
-    "distinct": 3,
+    "distinct": 4,
     "numeric": false,
     "default_visible": false,
     "default_filter": false
@@ -228,7 +228,7 @@
     "name": "k8s_instance",
     "kind": "facet",
     "label": "K8s Instance",
-    "distinct": 26,
+    "distinct": 29,
     "numeric": false,
     "default_visible": false,
     "default_filter": false
@@ -237,7 +237,7 @@
     "name": "node_name",
     "kind": "facet",
     "label": "Node",
-    "distinct": 7,
+    "distinct": 12,
     "numeric": false,
     "default_visible": false,
     "default_filter": false
@@ -246,7 +246,7 @@
     "name": "x_trace_id",
     "kind": "facet",
     "label": "X-Trace-ID",
-    "distinct": 43,
+    "distinct": 28,
     "numeric": false,
     "default_visible": false,
     "default_filter": false
@@ -273,7 +273,7 @@
     "name": "parse_ok",
     "kind": "facet",
     "label": "Parse OK",
-    "distinct": 1,
+    "distinct": 2,
     "numeric": false,
     "default_visible": false,
     "default_filter": false
