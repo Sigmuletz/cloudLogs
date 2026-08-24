@@ -131,14 +131,37 @@ Rules run top to bottom. **A rule only writes a column that is still empty** —
 so the first rule to produce a non-null value wins, and reordering the file is
 how you change priority. There is no `overwrite:` flag.
 
-### 2.5 Types and casting
+### 2.5 Folding alternative spellings (`map:`)
+
+One log source writes `WARN`, another writes `warning`, a third `INFO0`. Left
+alone they are three facet rows and `level:WARN` finds only one of them. A
+column may declare `map:` to fold them onto one value:
+
+```yaml
+columns:
+  - name: level
+    kind: facet
+    map:
+      warning: WARN
+      info0: INFO
+      fatal: ERROR
+```
+
+Keys are matched **case-insensitively** against whatever a rule wrote, and a
+value nobody listed passes through as written. The fold happens at write time,
+before casting, so a later rule reading that column sees the canonical value
+too. Mapped values are checked against the column's `type:` at load, and two
+keys differing only by case are an error rather than a silent winner. The
+original spelling is still in `_raw` and in the log line the drawer shows.
+
+### 2.6 Types and casting
 
 `type:` is one of `str` (default), `int`, `float`, `bool`, `time`. A value that
 will not cast becomes **null**, and the failure is counted and reported. A typed
 column therefore holds that type or nothing — `req_duration_ms:>=100` can never
 meet a string.
 
-### 2.6 Never-drop parsing
+### 2.7 Never-drop parsing
 
 L1 is fixed: `json.loads` once, again when the result is a string. A line that
 is not JSON becomes `{message: <raw text>}` and the rules run over it anyway, so
@@ -148,7 +171,7 @@ that fails everything still becomes a row with `parse_ok: false` and its text in
 `message` null and keeps the payload in `_raw`, which the drawer shows.
 Nothing is ever dropped.
 
-### 2.7 Validation
+### 2.8 Validation
 
 The whole file is validated before a single line is parsed: YAML syntax, every
 regex compiled, every `target` present in `columns:`, every `type` known, every
@@ -165,14 +188,14 @@ rules.yaml:22: rule targets unknown column 'req_stauts_code'
     did you mean 'req_status_code'?
 ```
 
-### 2.8 Engine-provided columns
+### 2.9 Engine-provided columns
 
 `source_file` and `parse_ok` are appended after the declared columns, and `_raw`
 is attached to every record. They cannot be declared, reordered or written by a
 rule — a rule targeting one is a validation error. `_raw` stays **drawer-only**:
 never a table column, never a filter.
 
-### 2.9 Output record schema
+### 2.10 Output record schema
 
 The declared columns, in declaration order, then the engine's own. With the
 shipped `rules.yaml` that reproduces today's 30 columns exactly:
@@ -221,7 +244,7 @@ ordinary sources listed on the `req_*` columns that want them, and `service` is
 an ordinary rule. What feeds what is readable off `rules.yaml`, in order, with
 no autodetection and no heuristics hidden in Python.
 
-### 2.10 Column metadata (`columns.json`, emitted next to `logs.json`)
+### 2.11 Column metadata (`columns.json`, emitted next to `logs.json`)
 
 A column's `kind` comes from `rules.yaml` when declared; otherwise it is
 classified from the data exactly as before:
@@ -237,7 +260,7 @@ Each entry: `{name, kind, label, distinct, numeric, default_visible, default_fil
 The file's shape is unchanged, so `query.py`, `lucene.py` and the frontend need
 no change: a column added in `rules.yaml` shows up in the UI on its own.
 
-### 2.11 Reporting
+### 2.12 Reporting
 
 Ingest counts how many lines each rule matched and how many values failed to
 cast. A rule that never fires is flagged — the most common thing to get wrong
@@ -265,7 +288,7 @@ job.
 
 `parse_ok` is true when the JSON decoded **and** every `required` rule matched.
 
-### 2.12 CLI
+### 2.13 CLI
 
 ```bash
 python -m cloudlogs.ingest example/logs.log                # → data/logs.json
@@ -440,6 +463,12 @@ Vanilla JS + CSS. No npm, no bundler, no framework. Dark theme.
   `¹²³` precedence badge. Server-side; scroll resets to top.
 * **Infinite scroll**: fetch next 200 when within 300px of the bottom.
 * **Row click** → right drawer: every normalized field + pretty-printed `_raw`.
+* **Keyboard**: `↑`/`↓` move the selected row, scrolling it into view and paging
+  in more rows at the bottom; `space` opens the drawer on the selection and
+  closes it again; `Esc` closes it. With the drawer open the selection drags it
+  along, so holding `↓` walks the records one by one. Closing keeps the row
+  selected, so the arrows carry on from where you were. Keys are ignored while
+  a text field or a context menu has focus.
 * **Cell context menu** (right-click or hover chevron): *Filter for value* /
   *Filter out value* / *Copy value* — adds the filter card if absent.
 * Level pills: ERROR red (+ row tint), WARN amber, INFO blue, DEBUG grey.
@@ -596,6 +625,20 @@ Run:
 ./run.sh --help
 pytest                        # engine, rules, query and lucene suites
 ```
+
+The same thing without the shell wrapper — `cloudlogs/main.py` is its own CLI:
+
+```bash
+python -m cloudlogs.main                       # default input, :8000
+python -m cloudlogs.main path/to/app.log       # ingest this file
+python -m cloudlogs.main a.log logs/ 'g/**/*.log'
+python -m cloudlogs.main app.log -p 9000 --host 127.0.0.1
+python -m cloudlogs.main app.log --rules my.yaml --data /tmp/out.json --reload
+```
+
+`python -m` needs the package on the import path, so run it from the project
+root, or `pip install -e .` once — which also installs a bare `cloudlogs`
+command that works from anywhere.
 
 Paths given on the command line are resolved against the directory you ran the
 script in, not the project root, and they override `CLOUDLOGS_INPUT`.

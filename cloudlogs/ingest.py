@@ -6,7 +6,7 @@
     python -m cloudlogs.ingest logs.log --rules experiments.yaml
 
 What each line becomes is declared in `rules.yaml`, not here: this module owns
-the file walking, the column metadata and the report (PLAN.md 2.10 - 2.12).
+the file walking, the column metadata and the report (PLAN.md 2.12 - 2.13).
 
 Reusable API (used by `cloudlogs.main` to ingest on startup):
 
@@ -26,7 +26,7 @@ Reusable API (used by `cloudlogs.main` to ingest on startup):
         takes the same files/globs/directories the CLI accepts.
 
     format_summary(summary) -> str
-        The per-rule report printed by the CLI (PLAN.md 2.11).
+        The per-rule report printed by the CLI (PLAN.md 2.12).
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ from .rules import ENGINE_COLUMNS, Column, Ruleset, RulesError, find_rules_path,
 DEFAULT_OUT = Path("data/logs.json")
 COLUMNS_NAME = "columns.json"
 
-#: `facet` when a column has at most this many distinct values (PLAN.md 2.10)
+#: `facet` when a column has at most this many distinct values (PLAN.md 2.11)
 FACET_MAX_DISTINCT = 200
 
 #: a numeric column with at most this many distinct values is still a checkbox
@@ -164,7 +164,7 @@ def is_stale(
 
 
 # --------------------------------------------------------------------------
-# column metadata (PLAN.md 2.10)
+# column metadata (PLAN.md 2.11)
 # --------------------------------------------------------------------------
 
 
@@ -336,10 +336,10 @@ def ingest(
 
 
 def format_summary(summary: dict[str, Any]) -> str:
-    """The per-rule report of PLAN.md 2.11.
+    """The per-rule report of PLAN.md 2.12.
 
     The count is what a rule *contributed*, not merely what it matched, and two
-    kinds of idle rule are flagged apart (PLAN.md 2.11). A rule that never
+    kinds of idle rule are flagged apart (PLAN.md 2.12). A rule that never
     matched carries ``⚠``: it is probably a mistake, and nothing else reveals
     it. A rule that matched but always lost to an earlier one carries a plain
     ``·``: a fallback that this input never needed is doing its job.

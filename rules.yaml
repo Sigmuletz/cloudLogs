@@ -12,7 +12,30 @@ columns:
   # ---- the application log line -------------------------------------------
   - {name: time, type: time, default_visible: true}
   - {name: app_time, type: time}
-  - {name: level, default_visible: true}
+  # `map:` folds alternative spellings onto one value, matched case-
+  # insensitively, so WARN / warn / warning are a single facet row and
+  # `level:WARN` finds all of them. Anything unlisted passes through as
+  # written. Add a line here when a new log source spells a level its own way.
+  - name: level
+    default_visible: true
+    map:
+      warning: WARN
+      warn: WARN
+      wrn: WARN
+      info0: INFO
+      information: INFO
+      informational: INFO
+      inf: INFO
+      err: ERROR
+      error0: ERROR
+      fatal: ERROR
+      severe: ERROR
+      critical: ERROR
+      dbg: DEBUG
+      debug0: DEBUG
+      fine: DEBUG
+      verbose: DEBUG
+      trace: TRACE
   - {name: logger, default_visible: true}
   - {name: method}
   - {name: src_line, type: int, label: Source Line}

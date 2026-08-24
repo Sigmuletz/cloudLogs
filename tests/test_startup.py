@@ -1,4 +1,4 @@
-"""The server's startup contract around `rules.yaml` (PLAN.md 2.7).
+"""The server's startup contract around `rules.yaml` (PLAN.md 2.8).
 
 A broken ruleset is the one failure `cloudlogs.main` must not survive: serving
 the previous `logs.json` would show data that no longer matches the rules on
@@ -8,6 +8,7 @@ disk, which is exactly what "validate up front" exists to prevent.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -61,3 +62,66 @@ def test_startup_succeeds_with_a_valid_ruleset(tmp_path, monkeypatch) -> None:
     summary = main.load_state()
     assert summary["ingested"] is True
     assert summary["records"] == 1
+
+
+# --------------------------------------------------------------------------
+# the CLI -- `python -m cloudlogs.main app.log`
+# --------------------------------------------------------------------------
+
+
+def _run_cli(monkeypatch, argv, cwd=None):
+    """Call main() with uvicorn stubbed out, returning what it would serve."""
+    served = {}
+
+    def fake_run(app, **kw):
+        served.update(kw)
+        served["app"] = app
+        served["input"] = os.environ.get("CLOUDLOGS_INPUT")
+        served["rules"] = os.environ.get("CLOUDLOGS_RULES")
+        served["data"] = os.environ.get("CLOUDLOGS_DATA")
+
+    uvicorn = pytest.importorskip("uvicorn")
+    monkeypatch.setattr(uvicorn, "run", fake_run)
+    if cwd is not None:
+        monkeypatch.chdir(cwd)
+    main.main(argv)
+    return served
+
+
+def test_cli_resolves_a_relative_log_against_the_callers_directory(tmp_path, monkeypatch) -> None:
+    """A path typed on the CLI means "relative to where I am standing"."""
+    (tmp_path / "app.log").write_text("", encoding="utf-8")
+    served = _run_cli(monkeypatch, ["app.log"], cwd=tmp_path)
+    assert served["input"] == str(tmp_path / "app.log")
+
+
+def test_cli_keeps_an_absolute_path_and_a_glob(tmp_path, monkeypatch) -> None:
+    """An absolute path is untouched; a glob stays a pattern for ingest."""
+    served = _run_cli(monkeypatch, [str(tmp_path / "a.log"), "logs/**/*.log"], cwd=tmp_path)
+    parts = served["input"].split(os.pathsep)
+    assert parts[0] == str(tmp_path / "a.log")
+    assert parts[1] == str(tmp_path / "logs/**/*.log")
+
+
+def test_cli_port_and_host_are_named_flags(tmp_path, monkeypatch) -> None:
+    """`-p 9000 app.log` must not bind the path to --host."""
+    served = _run_cli(monkeypatch, ["-p", "9000", "--host", "127.0.0.1", "app.log"], cwd=tmp_path)
+    assert served["port"] == 9000
+    assert served["host"] == "127.0.0.1"
+    assert served["input"] == str(tmp_path / "app.log")
+
+
+def test_cli_without_inputs_leaves_the_environment_alone(tmp_path, monkeypatch) -> None:
+    """No arguments means whatever CLOUDLOGS_INPUT already said."""
+    monkeypatch.setenv("CLOUDLOGS_INPUT", "/somewhere/else.log")
+    served = _run_cli(monkeypatch, [], cwd=tmp_path)
+    assert served["input"] == "/somewhere/else.log"
+
+
+def test_cli_rules_and_data_flags(tmp_path, monkeypatch) -> None:
+    """--rules and --data are absolutised too, so cwd never matters later."""
+    served = _run_cli(
+        monkeypatch, ["--rules", "my.yaml", "--data", "out.json"], cwd=tmp_path
+    )
+    assert served["rules"] == str(tmp_path / "my.yaml")
+    assert served["data"] == str(tmp_path / "out.json")

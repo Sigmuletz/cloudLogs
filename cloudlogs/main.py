@@ -49,11 +49,12 @@ pathological cardinality cannot blow up the payload.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
@@ -82,7 +83,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 DEFAULT_INPUT = "example/logs.log"
 DEFAULT_DATA = "data/logs.json"
 
-FACET_DISTINCT_CAP = 200  # PLAN.md 2.5: a column is facet-kind at <= 200 distinct
+FACET_DISTINCT_CAP = 200  # PLAN.md 2.6: a column is facet-kind at <= 200 distinct
 MAX_FACET_VALUES = 1000  # hard cap on values returned per facet column
 
 # --------------------------------------------------------------------------- #
@@ -115,7 +116,7 @@ def data_path() -> Path:
 
 
 def _infer_columns(records: list[dict]) -> list[dict]:
-    """Fallback column metadata when ``columns.json`` is absent (PLAN.md 2.5)."""
+    """Fallback column metadata when ``columns.json`` is absent (PLAN.md 2.6)."""
     names: list[str] = []
     seen: set[str] = set()
     for rec in records:
@@ -180,7 +181,7 @@ def load_state(force_ingest: bool = False) -> dict[str, Any]:
     global RECORDS, COLUMNS
 
     # Validate the ruleset first, even when nothing needs re-ingesting: a
-    # broken rules.yaml must never be served past (PLAN.md 2.7), and skipping
+    # broken rules.yaml must never be served past (PLAN.md 2.8), and skipping
     # this when logs.json happens to be fresh would do exactly that.
     if load_rules is not None:
         load_rules()
@@ -251,7 +252,7 @@ async def lifespan(_app: FastAPI):
         load_state()
     except RulesError as exc:
         # A broken rules.yaml is the one failure the server must not survive
-        # (PLAN.md 2.7): serving the previous logs.json would quietly show
+        # (PLAN.md 2.8): serving the previous logs.json would quietly show
         # stale data that does not match the rules on disk.
         print(f"cloudlogs: {exc}")
         raise
@@ -424,3 +425,88 @@ def index() -> Any:
         'The API is up: <code>POST /api/logs</code>, <code>GET /api/columns</code>.</p>',
         status_code=200,
     )
+
+
+# --------------------------------------------------------------------------
+# CLI -- `python -m cloudlogs.main app.log`, the same job as run.sh
+# --------------------------------------------------------------------------
+
+
+def _resolve_inputs(values: Sequence[str]) -> str:
+    """Absolutise each input against the CALLER's directory.
+
+    `input_paths()` resolves relative entries against the project root so the
+    server behaves the same however it was launched -- but a path typed on the
+    command line means "relative to where I am standing", so it is resolved
+    here instead. A glob is kept as a pattern; ingest expands it.
+    """
+    here = Path.cwd()
+    parts = [str(v if Path(v).is_absolute() else here / v) for v in values]
+    return os.pathsep.join(parts)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Start the viewer, optionally against the log files named on the CLI."""
+    import uvicorn
+
+    parser = argparse.ArgumentParser(
+        prog="cloudlogs",
+        description="Serve the cloudlogs viewer, ingesting first when needed.",
+        epilog=(
+            "examples:\n"
+            "  python -m cloudlogs.main                     serve the default input\n"
+            "  python -m cloudlogs.main app.log             ingest this file instead\n"
+            "  python -m cloudlogs.main a.log b.log logs/   several files, or a directory\n"
+            "  python -m cloudlogs.main 'logs/**/*.log'     a glob -- quote it\n"
+            "  python -m cloudlogs.main app.log -p 9000 --host 127.0.0.1\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "inputs",
+        nargs="*",
+        metavar="LOG",
+        help="log files, globs or directories to ingest (default: $CLOUDLOGS_INPUT, "
+        "then example/logs.log); relative paths are taken from the current directory",
+    )
+    parser.add_argument(
+        "-p", "--port", type=int, default=int(os.environ.get("PORT", 8000)),
+        help="port to listen on (default: 8000, or $PORT)",
+    )
+    parser.add_argument(
+        "--host", default=os.environ.get("HOST", "0.0.0.0"),
+        help="address to bind (default: 0.0.0.0, or $HOST). There is no "
+        "authentication: use 127.0.0.1 on an untrusted network",
+    )
+    parser.add_argument(
+        "--rules", metavar="PATH",
+        help="columns + extraction rules to ingest with (default: rules.yaml)",
+    )
+    parser.add_argument(
+        "--data", metavar="PATH",
+        help=f"where the normalized records live (default: {DEFAULT_DATA})",
+    )
+    parser.add_argument(
+        "--reload", action="store_true",
+        help="restart the server when the source changes (development)",
+    )
+    args = parser.parse_args(argv)
+
+    # the app reads its inputs from the environment, so the CLI just sets it
+    if args.inputs:
+        os.environ["CLOUDLOGS_INPUT"] = _resolve_inputs(args.inputs)
+    if args.rules:
+        os.environ["CLOUDLOGS_RULES"] = str(Path(args.rules).resolve())
+    if args.data:
+        os.environ["CLOUDLOGS_DATA"] = str(Path(args.data).resolve())
+
+    print(f"cloudlogs: input {', '.join(input_paths())}")
+    print(f"cloudlogs: http://localhost:{args.port}")
+    uvicorn.run(
+        "cloudlogs.main:app", host=args.host, port=args.port, reload=args.reload
+    )
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised by hand
+    raise SystemExit(main())

@@ -1519,7 +1519,7 @@ function openTzPicker(anchor) {
             saveLayout();
             renderTzButton();
             renderRows(0);
-            if (state.selectedRow !== null) renderDrawer();
+            if (state.selectedRow !== null && drawerOpen()) renderDrawer();
           }
         };
       });
@@ -1820,12 +1820,38 @@ async function openDrawer(i) {
   }
 }
 
+function drawerOpen() { return !$('drawer').hidden; }
+
+/* Closing the drawer keeps the row selected: the arrow keys carry on from
+   where you were, and space reopens the same record. */
 function closeDrawer() {
   $('drawer').hidden = true;
   $('drawer-grip').hidden = true;
-  state.selectedRow = null;
-  var prev = $('tbody').querySelector('tr.selected');
-  if (prev) prev.classList.remove('selected');
+}
+
+/* Keyboard row navigation. Up/down move the selection, space opens the record
+   next to it. With the drawer already open the selection drags it along, so
+   holding a cursor key walks the records one after another. */
+function moveSelection(delta) {
+  var n = state.rows.length;
+  if (!n) return;
+  var cur = state.selectedRow;
+  var next = cur === null ? (delta > 0 ? 0 : n - 1) : cur + delta;
+  next = Math.max(0, Math.min(n - 1, next));
+  state.selectedRow = next;
+  markSelected(next);
+
+  var tr = $('tbody').querySelector('tr[data-i="' + next + '"]');
+  if (tr && tr.scrollIntoView) tr.scrollIntoView({ block: 'nearest' });
+  if (next >= n - 1) maybeLoadMore();          // arrowing to the end pages in more
+  if (drawerOpen()) openDrawer(next);
+}
+
+/* Never steal a key from a text field -- the query bar, a facet value search. */
+function isTypingTarget(node) {
+  if (!node || !node.tagName) return false;
+  var tag = node.tagName.toUpperCase();
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || node.isContentEditable;
 }
 
 function kvRow(grid, k, v, cls) {
@@ -2047,7 +2073,18 @@ function installGlobalHandlers() {
     maybeLoadMore();
   });
   window.addEventListener('keydown', function (e) {
-    if (e.key === 'Escape' && !curPop && !$('drawer').hidden) closeDrawer();
+    if (e.key === 'Escape' && !curPop && drawerOpen()) { closeDrawer(); return; }
+    if (curPop || isTypingTarget(e.target)) return;   // a menu or a field owns the keyboard
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
+
+    if (e.key === 'ArrowDown') { e.preventDefault(); moveSelection(1); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); moveSelection(-1); }
+    else if (e.key === ' ' || e.key === 'Spacebar') {
+      e.preventDefault();                              // space would scroll the table
+      if (state.selectedRow === null) { moveSelection(1); openDrawer(state.selectedRow); }
+      else if (drawerOpen()) closeDrawer();
+      else openDrawer(state.selectedRow);
+    }
   });
 
   installHeaderInteractions();

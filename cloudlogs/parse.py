@@ -2,12 +2,12 @@
 
 Pure functions over strings and dicts -- no file I/O, no printing and, by
 design, **no mapping tables**. Everything this module knows about the shape of
-a log line comes from ``rules.yaml`` (PLAN.md 2.1 - 2.9); adding a column or a
+a log line comes from ``rules.yaml`` (PLAN.md 2.1 - 2.10); adding a column or a
 second way of filling one is an edit to that file, never to this one.
 
 How one line becomes a record:
 
-1. **Decode** (fixed, PLAN.md 2.6). ``json.loads`` once, and again when the
+1. **Decode** (fixed, PLAN.md 2.7). ``json.loads`` once, and again when the
    result is itself a string. A line that is not JSON -- or that decodes to
    something other than an object -- becomes the working dict
    ``{"message": <raw text>}`` and the rules run over it anyway, so nothing is
@@ -19,9 +19,9 @@ How one line becomes a record:
 3. **Cast** every written value to its column's ``type:`` with
    :func:`cloudlogs.rules._cast` -- the same caster that validates ``default:``
    at load time, so a value means the same thing in both places. A value that
-   will not cast becomes null and is reported (PLAN.md 2.5).
+   will not cast becomes null and is reported (PLAN.md 2.6).
 4. **Emit** the declared non-internal columns in declaration order, then the
-   engine's own ``source_file`` and ``parse_ok``, plus ``_raw`` (PLAN.md 2.8).
+   engine's own ``source_file`` and ``parse_ok``, plus ``_raw`` (PLAN.md 2.9).
 
 :func:`parse_line` returns just the record; :func:`parse_record` also returns a
 :class:`ParseStatus` (which rules matched) and the cast failures, which is what
@@ -86,7 +86,7 @@ class ParseResult:
 
 
 # --------------------------------------------------------------------------
-# L1 -- decode (fixed, PLAN.md 2.6)
+# L1 -- decode (fixed, PLAN.md 2.7)
 # --------------------------------------------------------------------------
 
 
@@ -157,6 +157,7 @@ class _Writer:
 
     def __init__(self, ruleset: Ruleset) -> None:
         self.types = {column.name: column.type for column in ruleset.columns}
+        self.maps = {c.name: c.mapping for c in ruleset.columns if c.mapping}
         self.values: dict[str, Any] = {column.name: None for column in ruleset.columns}
         self.failures: list[tuple[str, Any]] = []
 
@@ -172,6 +173,14 @@ class _Writer:
         cleaned = _clean(value)
         if cleaned is None:
             return False
+        # fold alternative spellings before casting, so `warning` and `WARN`
+        # are one value everywhere downstream (PLAN.md 2.5)
+        mapping = self.maps.get(column)
+        if mapping:
+            folded = mapping.get(str(cleaned).strip().lower())
+            if folded is not None:
+                self.values[column] = folded
+                return True
         ok, cast = _cast(cleaned, self.types.get(column, "str"))
         if not ok:
             self.failures.append((column, cleaned))

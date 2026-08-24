@@ -74,7 +74,7 @@ def double_encoded(payload: dict) -> str:
 
 
 # --------------------------------------------------------------------------
-# L1 -- decoding (fixed, PLAN.md 2.6)
+# L1 -- decoding (fixed, PLAN.md 2.7)
 # --------------------------------------------------------------------------
 
 
@@ -887,3 +887,55 @@ def test_all_still_loses_to_an_earlier_rule(tmp_path) -> None:
     ruleset = load_rules(path)
     record = parse_line(json.dumps({"log": "a 1 b 2", "first": "kept"}), "f.log", ruleset)
     assert record["ids"] == "kept"
+
+
+# --------------------------------------------------------------------------
+# `map:` in the engine
+# --------------------------------------------------------------------------
+
+
+def _level_ruleset(tmp_path):
+    path = tmp_path / "rules.yaml"
+    path.write_text(
+        "columns:\n"
+        "  - {name: level, map: {warning: WARN, info0: INFO, fatal: ERROR}}\n"
+        "  - {name: echo}\n"
+        "rules:\n"
+        "  - {target: level, from: lv}\n"
+        "  - {target: echo, from: level}\n",
+        encoding="utf-8",
+    )
+    return load_rules(path)
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("warning", "WARN"),
+        ("Warning", "WARN"),
+        ("WARNING", "WARN"),
+        ("  warning  ", "WARN"),
+        ("INFO0", "INFO"),
+        ("fatal", "ERROR"),
+        ("WARN", "WARN"),        # already canonical, untouched
+        ("NOTICE", "NOTICE"),    # unmapped, passes through as written
+    ],
+)
+def test_map_folds_alternative_spellings(tmp_path, raw, expected) -> None:
+    """Whatever the log wrote, the column holds one canonical value."""
+    ruleset = _level_ruleset(tmp_path)
+    record = parse_line(json.dumps({"lv": raw}), "f.log", ruleset)
+    assert record["level"] == expected
+
+
+def test_map_applies_before_a_later_rule_reads_the_column(tmp_path) -> None:
+    """The mapping happens at write time, so the pipeline sees canonical values."""
+    ruleset = _level_ruleset(tmp_path)
+    record = parse_line(json.dumps({"lv": "warning"}), "f.log", ruleset)
+    assert record["echo"] == "WARN"
+
+
+def test_map_does_not_fire_for_a_null(tmp_path) -> None:
+    """An absent source stays null rather than looking itself up."""
+    ruleset = _level_ruleset(tmp_path)
+    assert parse_line(json.dumps({}), "f.log", ruleset)["level"] is None

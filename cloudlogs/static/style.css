@@ -289,6 +289,9 @@ td .null { color: var(--fg-faint); }
   font-weight: 700;
   line-height: 15px;
   letter-spacing: .4px;
+  /* a level nobody mapped still reads as a level rather than bare text */
+  background: rgba(127, 139, 156, .16);
+  color: var(--lvl-debug);
 }
 .pill-ERROR { background: rgba(255,95,95,.18);  color: var(--lvl-error); }
 .pill-WARN  { background: rgba(255,180,84,.18); color: var(--lvl-warn); }

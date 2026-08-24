@@ -7,7 +7,7 @@ the engine's job (``cloudlogs/parse.py``).
 
 Everything is validated before :func:`load_rules` returns, and the **first**
 problem aborts with the file, the 1-based line and, where it helps, a caret
-block (PLAN.md 2.7)::
+block (PLAN.md 2.8)::
 
     rules.yaml:14: invalid regex in rule 'status'
         regex: 'status code: (\\d+'
@@ -38,19 +38,19 @@ import yaml
 DEFAULT_RULES_FILENAME = "rules.yaml"
 
 #: appended by the engine after the declared columns; not declarable, not
-#: writable by a rule (PLAN.md 2.8)
+#: writable by a rule (PLAN.md 2.9)
 ENGINE_COLUMNS: tuple[str, ...] = ("source_file", "parse_ok")
 
-#: values accepted by a column's ``type:`` (PLAN.md 2.5)
+#: values accepted by a column's ``type:`` (PLAN.md 2.6)
 VALID_TYPES: tuple[str, ...] = ("str", "int", "float", "bool", "time")
 
 #: values accepted by a column's ``kind:``; ``None`` means "classify from the
-#: data" (PLAN.md 2.10)
+#: data" (PLAN.md 2.11)
 VALID_KINDS: tuple[str, ...] = ("facet", "number", "time", "text")
 
 #: keys a ``columns:`` entry may carry
 COLUMN_KEYS: frozenset[str] = frozenset(
-    {"name", "type", "kind", "label", "default_visible", "default", "internal"}
+    {"name", "type", "kind", "label", "default_visible", "default", "internal", "map"}
 )
 
 #: keys a ``rules:`` entry may carry (PLAN.md 2.2)
@@ -120,6 +120,10 @@ class Column:
     default_visible: bool | None = None
     default: Any = None
     internal: bool = False
+    #: alternative spellings folded onto one value (PLAN.md 2.5) -- lowercased
+    #: key -> the value to store instead. Applied to whatever a rule wrote,
+    #: before casting, so `warning` and `WARN` become one facet value.
+    mapping: Mapping[str, Any] = field(default_factory=dict)
     line: int = 0
 
 
@@ -257,14 +261,19 @@ def _typename(value: Any) -> str:
     """A human word for the type of ``value``, for "got X" messages."""
     if value is None:
         return "nothing"
-    return {
-        bool: "a boolean",
-        int: "a number",
-        float: "a number",
-        str: "a string",
-        list: "a list",
-        dict: "a mapping",
-    }.get(type(value), type(value).__name__)
+    # isinstance, not type(): the line-tracking loader below subclasses dict
+    # and list, and "got _LineList" means nothing to whoever reads the error
+    if isinstance(value, bool):
+        return "a boolean"
+    if isinstance(value, (int, float)):
+        return "a number"
+    if isinstance(value, str):
+        return "a string"
+    if isinstance(value, Mapping):
+        return "a mapping"
+    if isinstance(value, (list, tuple)):
+        return "a list"
+    return type(value).__name__
 
 
 _FRACTION_RE = re.compile(r"(\.\d{6})\d+")
@@ -273,7 +282,7 @@ _FRACTION_RE = re.compile(r"(\.\d{6})\d+")
 def _cast(value: Any, type_: str) -> tuple[bool, Any]:
     """Cast ``value`` to a column ``type:``; ``(False, None)`` when it will not.
 
-    The single caster in the project (PLAN.md 2.5): it validates a ``default:``
+    The single caster in the project (PLAN.md 2.6): it validates a ``default:``
     here at load time and ``cloudlogs.parse`` imports it to cast every value it
     writes, so a column's type means exactly the same thing in both places.
 
@@ -586,6 +595,42 @@ def _build_column(
             f"column {name!r} has a non-boolean 'internal:', got {_typename(internal)}",
         )
 
+    mapping: dict[str, Any] = {}
+    if "map" in entry:
+        raw_map = entry["map"]
+        if not isinstance(raw_map, dict) or not raw_map:
+            raise RulesError(
+                path,
+                _line_of(entry, "map", line),
+                f"column {name!r} has a 'map:' that is not a non-empty mapping, "
+                f"got {_typename(raw_map)}",
+            )
+        for key, value in raw_map.items():
+            if not isinstance(key, (str, int, float, bool)) or str(key).strip() == "":
+                raise RulesError(
+                    path,
+                    _line_of(entry, "map", line),
+                    f"column {name!r} has a blank or non-scalar key in 'map:', "
+                    f"got {_typename(key)}",
+                )
+            folded = str(key).strip().lower()
+            if folded in mapping:
+                raise RulesError(
+                    path,
+                    _line_of(entry, "map", line),
+                    f"column {name!r} maps {key!r} twice; keys are matched "
+                    "case-insensitively, so they must differ by more than case",
+                )
+            ok, cast = _cast(value, type_)
+            if not ok:
+                raise RulesError(
+                    path,
+                    _line_of(entry, "map", line),
+                    f"column {name!r} maps {key!r} to {value!r}, which does not "
+                    f"cast to {type_}",
+                )
+            mapping[folded] = cast
+
     default = entry.get("default")
     ok, cast = _cast(default, type_)
     if not ok:
@@ -603,6 +648,7 @@ def _build_column(
         default_visible=default_visible,
         default=cast,
         internal=internal,
+        mapping=mapping,
         line=line or 0,
     )
 
@@ -691,7 +737,7 @@ def _check_writable(
     path: Path,
     label: str,
 ) -> None:
-    """A rule may only write a declared, non-engine column (PLAN.md 2.8)."""
+    """A rule may only write a declared, non-engine column (PLAN.md 2.9)."""
     if name in ENGINE_COLUMNS:
         raise RulesError(
             path,

@@ -1,6 +1,6 @@
 """Tests for the rules loader (PLAN.md section 2, `cloudlogs/rules.py`).
 
-Every validation error listed in PLAN.md 2.7 gets a test that asserts both the
+Every validation error listed in PLAN.md 2.8 gets a test that asserts both the
 message and the 1-based line number it points at -- a rules error with the
 wrong line is worth no more than no error at all.
 """
@@ -1043,3 +1043,58 @@ def test_all_must_be_a_boolean(tmp_path) -> None:
     with pytest.raises(RulesError) as excinfo:
         load_rules(rules)
     assert "non-boolean 'all:'" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------
+# `map:` -- alternative spellings folded onto one value (PLAN.md 2.5)
+# --------------------------------------------------------------------------
+
+
+def test_map_is_folded_to_lowercase_keys(tmp_path) -> None:
+    """Keys are matched case-insensitively, so they are stored folded."""
+    rules = write(
+        tmp_path,
+        "columns:\n"
+        "  - {name: level, map: {Warning: WARN, INFO0: INFO}}\n"
+        "rules: [{target: level, from: lv}]\n",
+    )
+    column = load_rules(rules).columns[0]
+    assert column.mapping == {"warning": "WARN", "info0": "INFO"}
+
+
+def test_map_values_must_cast_to_the_column_type(tmp_path) -> None:
+    """A map that would put a string in an int column is caught at load."""
+    rules = write(
+        tmp_path,
+        "columns:\n"
+        "  - {name: code, type: int, map: {missing: not-a-number}}\n"
+        "rules: [{target: code, from: c}]\n",
+    )
+    with pytest.raises(RulesError) as excinfo:
+        load_rules(rules)
+    assert "does not cast to int" in str(excinfo.value)
+
+
+def test_map_keys_may_not_differ_only_by_case(tmp_path) -> None:
+    """`WARN` and `warn` as separate keys is a mistake, not two rules."""
+    rules = write(
+        tmp_path,
+        "columns:\n"
+        "  - {name: level, map: {WARN: WARN, warn: WARNING}}\n"
+        "rules: [{target: level, from: lv}]\n",
+    )
+    with pytest.raises(RulesError) as excinfo:
+        load_rules(rules)
+    assert "twice" in str(excinfo.value)
+
+
+def test_map_must_be_a_non_empty_mapping(tmp_path) -> None:
+    """A list, or an empty block, is a typo."""
+    for bad in ("[]", "{}"):
+        rules = write(
+            tmp_path,
+            f"columns:\n  - {{name: level, map: {bad}}}\nrules: [{{target: level, from: lv}}]\n",
+        )
+        with pytest.raises(RulesError) as excinfo:
+            load_rules(rules)
+        assert "non-empty mapping" in str(excinfo.value)
