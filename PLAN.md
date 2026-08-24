@@ -559,6 +559,7 @@ cloudlogs/
   pyproject.toml          fastapi, uvicorn[standard], PyYAML, pytest
   run.sh                  ingest-if-stale, then uvicorn :8000 (Linux/macOS/WSL)
   run.ps1                 the same, for Windows PowerShell
+  share-lan.ps1           forward a Windows port to the WSL distro (elevated)
   .gitignore
   cloudlogs/
     __init__.py
@@ -589,12 +590,23 @@ Run:
 
 ```bash
 ./run.sh                      # ingest-if-stale + uvicorn --reload :8000
-pytest                        # parse + query suites
+./run.sh path/to/app.log      # ingest this file instead of the default
+./run.sh a.log b.log logs/    # several files, or a directory
+./run.sh 'logs/**/*.log'      # a glob -- quote it so the shell keeps it
+./run.sh --help
+pytest                        # engine, rules, query and lucene suites
 ```
+
+Paths given on the command line are resolved against the directory you ran the
+script in, not the project root, and they override `CLOUDLOGS_INPUT`.
 
 ```powershell
 .\run.ps1                     # same thing on Windows, outside WSL
+.\run.ps1 path\to\app.log     # -Port and -BindHost stay named flags
 ```
+
+PowerShell may refuse an unsigned script; `powershell -ExecutionPolicy Bypass
+-File .\run.ps1` runs it without changing the machine's policy.
 
 Nothing in the code is WSL- or Linux-specific: paths go through `pathlib`,
 relative `CLOUDLOGS_INPUT` / `CLOUDLOGS_DATA` entries resolve against the

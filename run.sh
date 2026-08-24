@@ -1,18 +1,48 @@
 #!/usr/bin/env bash
 # Start the cloudlogs viewer. Ingest runs automatically at startup when
-# data/logs.json is missing or older than its inputs.
+# data/logs.json is missing or older than its inputs or than rules.yaml.
 #
-#   ./run.sh                          # http://localhost:8000
-#   PORT=9000 ./run.sh
+#   ./run.sh                          # http://localhost:8000, default input
+#   ./run.sh path/to/app.log          # ingest this file instead
+#   ./run.sh a.log b.log logs/        # several files, or a directory
+#   ./run.sh 'logs/**/*.log'          # a glob -- quote it so the shell keeps it
+#   PORT=9000 ./run.sh app.log
 #   HOST=127.0.0.1 ./run.sh           # loopback only (see the note below)
-#   CLOUDLOGS_INPUT='logs/**/*.log' ./run.sh
+#   CLOUDLOGS_INPUT='logs/**/*.log' ./run.sh    # same thing, as an environment
+#
+# Relative paths are taken from the directory you ran this in, not from the
+# project root. Arguments win over CLOUDLOGS_INPUT.
 #
 # The default bind is 0.0.0.0 so the server is reachable from outside the
 # machine it runs on -- from Windows when this is a WSL distro, and from other
 # hosts on the LAN. There is no authentication, so on an untrusted network set
 # HOST=127.0.0.1. Windows/LAN details: see "Running outside WSL" in PLAN.md.
 set -euo pipefail
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+fi
+
+# Resolve the inputs against the caller's directory before cd'ing away. A glob
+# is kept as a pattern -- ingest expands it -- so this cannot use realpath.
+launch_pwd="$PWD"
 cd "$(dirname "$0")"
+
+if [ "$#" -gt 0 ]; then
+    inputs=""
+    for arg in "$@"; do
+        case "$arg" in
+            /*) abs="$arg" ;;
+            *)  abs="$launch_pwd/$arg" ;;
+        esac
+        inputs="${inputs:+$inputs:}$abs"
+    done
+    export CLOUDLOGS_INPUT="$inputs"
+    echo "cloudlogs: input $CLOUDLOGS_INPUT"
+elif [ -n "${CLOUDLOGS_INPUT:-}" ]; then
+    echo "cloudlogs: input $CLOUDLOGS_INPUT  (from CLOUDLOGS_INPUT)"
+fi
 
 PY="${PYTHON:-$(command -v python3 || command -v python || true)}"
 if [ -z "$PY" ]; then
