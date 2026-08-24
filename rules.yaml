@@ -78,8 +78,9 @@ rules:
   # `<service>_<suffix>`, listed in priority order. A new service is one more
   # name in these lists. `ram_log_level` is deliberately absent: it repeats
   # `level`.
+  - {name: level/envelope, target: level, from: [level,severity]}
   - {name: req_path/envelope, target: req_path, from: [ram_path, information_path]}
-  - {name: req_status_code/envelope, target: req_status_code,  from: [ram_status_code, information_status_code]}
+  - {name: req_status_code/envelope, target: req_status_code,  from: [ram_status_code, information_status_code,tee_http_status,responseCode]}
   - {name: req_duration_ms/envelope, target: req_duration_ms, from: [ram_duration_ms, information_duration_ms]}
   - {name: req_host/envelope, target: req_host, from: [ram_host, information_host]}
   - {name: req_user_agent/envelope, target: req_user_agent, from: [ram_user_agent, information_user_agent]}
@@ -111,7 +112,7 @@ rules:
   # A line the pattern above did not match keeps its text rather than losing
   # it: the raw `log` string, or -- for a line that was not JSON at all -- the
   # raw text the engine handed the rules as `message`.
-  - {name: message/raw, target: message, from: [log, message]}
+  - {name: message/raw, target: message, from: [log, message, message_str, message_string, uriPath]}
 
   # ---- operation logs: `key: value | key: value | ...` ---------------------
   # Only a message with at least two `|` is treated as pipe-structured; every
@@ -136,9 +137,12 @@ rules:
   - {name: pipe/x-request-id, target: op_x_request_id, from: pipe_body, regex: '(?i)(?:^|\|)\s*x-request-id\s*:\s*([^|]*)'}
   - {name: pipe/has-response-payload, target: has_response_payload, from: pipe_body, regex: '(?i)(?:^|\|)\s*hasresponsepayload\s*:\s*([^|]*)'}
   - {name: pipe/status, target: req_status_code, from: message, regex: '(?i)received (\d+) response'}
-  - {name: pipe/status, target: req_status_code, from: message, regex: '(?i)returning response code: (\d+)'}
-  - {name: pipe/status, target: req_status_code, from: message, regex: '(?i)received response code: (\d+)'}
+  - {name: pipe/status, target: req_status_code, from: message, regex: '(?i)returning response code:* (\d+)'}
+  - {name: pipe/status, target: req_status_code, from: message, regex: '(?i)returning status code:* (\d+)'}
+  - {name: pipe/status, target: req_status_code, from: message, regex: '(?i)received response code:* (\d+)'}
   - {name: pipe/status, target: req_status_code, from: message, regex: '(?i)received response with status code: (\d+)'}
+  - {name: pipe/status, target: req_status_code, from: message, regex: '(?i)received status code:* (\d+)'}
+  - {name: pipe/status, target: req_status_code, from: message, regex: '(?i)status: (\d+)'}
   # `all: true` keeps EVERY match, joined with `sep:` (default: one per line)
   - {name: trace-ids, target: req_trace_ids, from: message, all: true, regex: '(?i)(\{?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}?)'}
   
