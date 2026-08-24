@@ -35,32 +35,147 @@ Max `log` length 569 chars. 51 lines carry pipe-delimited operation-log fields.
 
 ---
 
-## 2. Ingest (`cloudlogs/parse.py` + `cloudlogs/ingest.py`)
+## 2. Ingest (`rules.yaml` + `cloudlogs/parse.py` + `cloudlogs/ingest.py`)
 
-### 2.1 Layered, never-drop parsing
+Ingest is **configuration, not code**. `rules.yaml` at the project root declares
+every column and every extraction rule; `parse.py` is a rule engine with no
+mapping tables of its own. Adding a column, adding a second rule to an existing
+column, or extracting a new value with a regex is an edit to that one file.
 
-Each layer degrades independently. A line that fails every layer still becomes a
-row with `parse_ok: false` and the raw text in `message` + `_raw`.
+### 2.1 `rules.yaml`
+
+Git-tracked, edited in place. `--rules PATH` or `CLOUDLOGS_RULES=PATH` points at
+a different file for a one-off; there is no merging or layering — the file in
+use is the whole truth. Its mtime feeds `is_stale()`, so editing rules alone
+triggers a re-ingest.
+
+Two blocks:
+
+```yaml
+columns:
+  - {name: time,            type: time}
+  - {name: level,           kind: facet}
+  - {name: message,         kind: text}
+  - {name: req_status_code, type: int}
+  - {name: req_duration_ms, type: int}
+  - {name: trace_span}                      # kind auto-classified
+  - {name: pod_ref}
+
+rules:
+  - name: log-line                          # optional; defaults to target
+    required: true                          # counts toward parse_ok
+    from: log
+    regex: '^(?P<app_time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+(?P<level>\S+)\s+\[(?P<origin>[^\]]*)\]\s+\((?P<thread>[^)]*)\)\s*(?P<message>.*)$'
+
+  - target: req_status_code                 # first non-null wins
+    from: [ram_status_code, information_status_code]
+  - target: req_status_code                 # only fills what is still empty
+    from: message
+    regex: '(?:^|\|)\s*response status code:\s*([^|]+)'
+
+  - target: pod_ref                          # declared above like any column
+    join: [k8s_namespace, k8s_pod]
+    sep: '/'
+```
+
+`columns:` is the schema — it fixes column **order**, the `type` used for
+casting, and any UI override (`kind`, `label`, `default_visible`). `rules:` is
+an ordered pipeline.
+
+### 2.2 What one rule can do
+
+| key | meaning |
+|---|---|
+| `name` | label in the per-rule summary; defaults to `target` |
+| `target` | the column to write; must be declared in `columns:` |
+| `from` | source, or a list of sources tried in order (first non-null wins) |
+| `regex` | applied to the source; **group 1** → `target`, **named groups** → those columns |
+| `join` + `sep` | concatenate several sources into `target`, skipping nulls |
+| `all` + `sep` | keep **every** match of `regex`, not only the first, joined with `sep` (default: one per line) |
+| `required` | this rule's success counts toward `parse_ok` |
+
+A rule with named groups needs no `target`. A rule with `join` needs no
+`from`/`regex`. There is no `when:`, no transform chain and no template
+language — a second rule, or a better regex, covers those cases.
+
+`all: true` is for a value that legitimately occurs more than once in one line
+— trace ids, repeated headers. The column stays a plain string, so filtering,
+sorting and the query language need no notion of a list:
+
+```yaml
+  - {name: trace-ids, target: req_trace_ids, from: message, all: true,
+     regex: '(?i)(\{?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}?)'}
+```
+
+It takes exactly one capture group (or none, meaning the whole match), and is
+rejected alongside named groups or `join`, where "which value repeats" would be
+undefined. Duplicates are kept in the order they appear; a column that collects
+matches should be `type: str`, since a multi-line value will not cast to a
+number.
+
+### 2.3 Source addressing
+
+Rules read one namespace: a working dict that starts as the decoded envelope
+and accumulates the columns earlier rules produced. A produced column shadows a
+raw key of the same name.
+
+```yaml
+from: kubernetes.labels.pod-template-hash    # dotted path walks nesting
+from: message                                # the column, once a rule wrote it
+from: 'labels.app_kubernetes_io/version'     # quote a key with a literal dot
+```
+
+### 2.4 Order and precedence
+
+Rules run top to bottom. **A rule only writes a column that is still empty** —
+so the first rule to produce a non-null value wins, and reordering the file is
+how you change priority. There is no `overwrite:` flag.
+
+### 2.5 Types and casting
+
+`type:` is one of `str` (default), `int`, `float`, `bool`, `time`. A value that
+will not cast becomes **null**, and the failure is counted and reported. A typed
+column therefore holds that type or nothing — `req_duration_ms:>=100` can never
+meet a string.
+
+### 2.6 Never-drop parsing
+
+L1 is fixed: `json.loads` once, again when the result is a string. A line that
+is not JSON becomes `{message: <raw text>}` and the rules run over it anyway, so
+a plain-text log format is a regex rule rather than new configuration. A line
+that fails everything still becomes a row with `parse_ok: false` and its text in
+`message` + `_raw`. A record that decoded but carries no log text at all leaves
+`message` null and keeps the payload in `_raw`, which the drawer shows.
+Nothing is ever dropped.
+
+### 2.7 Validation
+
+The whole file is validated before a single line is parsed: YAML syntax, every
+regex compiled, every `target` present in `columns:`, every `type` known, every
+`from`/`join` well formed. The first error aborts with the file, the line and a
+caret; the CLI exits **2** and the server refuses to start. A half-applied
+ruleset is never possible.
 
 ```
-raw line
-  └─ L1  json.loads (once, then again if the result is a str)
-       └─ L2  envelope field extraction + kubernetes flatten
-       └─ L3  regex over `log`:  ^(TS)\s+(LEVEL)\s+\[(Logger).(method):(line)\]\s+\((thread)\)\s*(message)$
-            └─ L4  pipe fields inside message: `key: value | key: value | ...`
+rules.yaml:14: invalid regex in rule 'status'
+    regex: 'status code: (\d+'
+                        ^ missing ), unterminated subpattern
+
+rules.yaml:22: rule targets unknown column 'req_stauts_code'
+    did you mean 'req_status_code'?
 ```
 
-Ingest prints a per-layer summary:
+### 2.8 Engine-provided columns
 
-```
-564 lines → 564 records
-  json ok           564
-  log-pattern ok    564
-  pipe-fields ok     51
-  parse_ok=false      0
-```
+`source_file` and `parse_ok` are appended after the declared columns, and `_raw`
+is attached to every record. They cannot be declared, reordered or written by a
+rule — a rule targeting one is a validation error. `_raw` stays **drawer-only**:
+never a table column, never a filter.
 
-### 2.2 Output record schema
+### 2.9 Output record schema
+
+The declared columns, in declaration order, then the engine's own. With the
+shipped `rules.yaml` that reproduces today's 30 columns exactly:
 
 ```jsonc
 {
@@ -72,10 +187,10 @@ Ingest prints a per-layer summary:
   "src_line":             44,
   "thread":               "executor-thread-44978",
   "message":              "path: /v3/... | response status code: 404 | ...",
-  "service":              "ram",            // see §2.4
+  "service":              "ram",
   "req_path":             "/v3/internal/records/getGeneralConsent",
-  "req_status_code":      404,              // int
-  "req_duration_ms":      114,              // int
+  "req_status_code":      404,
+  "req_duration_ms":      114,
   "req_host":             "pu-epa-aoknds-ram-private....svc.cluster.local:11443",
   "req_user_agent":       "Apache-HttpClient/4.5.14",
   "req_x_header":         "unknown",
@@ -91,71 +206,77 @@ Ingest prints a per-layer summary:
   "k8s_instance":         "muc-pu-epa-aoknds-ram",
   "node_name":            "epa-be-prod-z1-cmpt1-c02",
   "x_trace_id":           "c074e9a7-8336-4323-885c-5dba361c24be",
-  "has_response_payload": true,             // bool
-  "source_file":          "example/logs.log",
-  "parse_ok":             true,
+  "has_response_payload": true,
+  "source_file":          "example/logs.log",   // engine
+  "parse_ok":             true,                 // engine
   "_raw":                 { /* untouched decoded original */ }
 }
 ```
 
-* `_raw` is **drawer-only** — never offered as a table column or a filter.
-* Dropped entirely: `_p`, `stream`, `file`, `tag`, and single-valued labels
-  (`component`, `part-of`, `product-id`, `helm_sh/chart`).
+Dropped by simply not being declared: `_p`, `stream`, `file`, `tag`, and the
+single-valued labels (`component`, `part-of`, `product-id`, `helm_sh/chart`).
 
-### 2.3 `log` string parsing
+**Nothing collapses by prefix any more.** `ram_*` and `information_*` are
+ordinary sources listed on the `req_*` columns that want them, and `service` is
+an ordinary rule. What feeds what is readable off `rules.yaml`, in order, with
+no autodetection and no heuristics hidden in Python.
 
-Pattern (all 564 sample lines match):
+### 2.10 Column metadata (`columns.json`, emitted next to `logs.json`)
 
-```
-2026-07-09 08:25:06 WARN  [OperationLogInterceptor.filter:44] (executor-thread-44978) | path: ...
-└── app_time ──┘ └level┘  └─ logger ─┘ └method┘ └line┘  └──── thread ────┘  └── message ──
-```
-
-Pipe fields (L4) seen: `path`, `response status code`, `x-request-id`,
-`x-useragent`, `user-agent`, `time(ms)`, `Host header`,
-`X-Forwarded-For header`, `HasResponsePayload`.
-
-They **backfill** `req_*` only where the prefixed twins are absent (5 of 51 rows);
-`x-request-id` always lands in `op_x_request_id`. `message` keeps its full
-original text either way.
-
-### 2.4 Prefix collapse and `service`
-
-`ram_*` and `information_*` are the same semantic columns under a per-component
-prefix. Collapse both to `req_*` and record which prefix supplied them.
-
-```
-prefix present            → service = "ram" | "information"
-else container_name       → "security-gate" | "notification" | "information" | "ram"
-no kubernetes key         → "unknown"
-```
-
-No `tenant` column — the insurer stays visible via `k8s_namespace` / `k8s_pod`.
-
-### 2.5 Column metadata (`columns.json`, emitted next to `logs.json`)
-
-Ingest classifies every column so the UI knows which widget to render:
+A column's `kind` comes from `rules.yaml` when declared; otherwise it is
+classified from the data exactly as before:
 
 | kind | rule | widget |
 |---|---|---|
 | `facet` | ≤ 200 distinct values, **including numeric columns with ≤ 25 distinct** (e.g. `req_status_code`) | checkbox list (+ value search when > 12) |
 | `number` | int/float column with > 25 distinct (e.g. `req_duration_ms`, `src_line`) | min/max inputs |
-| `time` | `time`, `app_time` | from/to range |
+| `time` | `type: time` columns (`time`, `app_time`) | from/to range |
 | `text` | everything else | substring input, regex toggle |
 
 Each entry: `{name, kind, label, distinct, numeric, default_visible, default_filter}`.
+The file's shape is unchanged, so `query.py`, `lucene.py` and the frontend need
+no change: a column added in `rules.yaml` shows up in the UI on its own.
 
-### 2.6 CLI
+### 2.11 Reporting
+
+Ingest counts how many lines each rule matched and how many values failed to
+cast. A rule that never fires is flagged — the most common thing to get wrong
+about a new regex is that it silently matches nothing.
+
+```
+564 lines → 564 records
+  json ok                    564
+  log-line       required    564
+  message/raw                  0  · matched 564, never needed
+  pipe/status-code            51
+  pipe/x-request-id           51
+  trace_span                   0  ⚠ never matched
+  parse_ok=false               0
+  ⚠ req_status_code: 3 values could not cast to int, e.g. 'n/a' (line 118)
+  → data/logs.json (30 columns → data/columns.json)
+```
+
+The count is what a rule **contributed**, not what it matched — a rule whose
+column an earlier rule already filled wrote nothing, however often its pattern
+hit. The two idle rules are flagged apart: `⚠ never matched` is probably a
+mistake and nothing else in the output would reveal it, while `· never needed`
+is a fallback this particular input did not require, which is a rule doing its
+job.
+
+`parse_ok` is true when the JSON decoded **and** every `required` rule matched.
+
+### 2.12 CLI
 
 ```bash
 python -m cloudlogs.ingest example/logs.log                # → data/logs.json
 python -m cloudlogs.ingest 'logs/**/*.log' -o data/all.json
 python -m cloudlogs.ingest logdir/                          # recurses *.log
+python -m cloudlogs.ingest logs.log --rules experiments.yaml
 ```
 
-Accepts files, globs and directories; adds `source_file` per record.
-Server auto-runs ingest at startup when `data/logs.json` is missing or older
-than any input.
+Accepts files, globs and directories; adds `source_file` per record. The server
+auto-runs ingest at startup when `data/logs.json` is missing or older than any
+input **or than `rules.yaml`**.
 
 ---
 
@@ -428,13 +549,15 @@ drag just rewrites the variable:
 ```
 cloudlogs/
   PLAN.md
-  pyproject.toml          fastapi, uvicorn[standard], pytest
+  rules.yaml              columns + extraction rules (the ingest config)
+  pyproject.toml          fastapi, uvicorn[standard], PyYAML, pytest
   run.sh                  ingest-if-stale, then uvicorn :8000 (Linux/macOS/WSL)
   run.ps1                 the same, for Windows PowerShell
   .gitignore
   cloudlogs/
     __init__.py
-    parse.py              line → record (pure, no I/O)
+    rules.py              rules.yaml → validated Ruleset (load + validate)
+    parse.py              rule engine: line + Ruleset → record (pure, no I/O)
     ingest.py             CLI: paths/globs/dirs → data/logs.json + columns.json
     query.py              filter + sort + facet over list[dict]
     lucene.py             Lucene-style query language (parse → AST → predicate)
@@ -447,7 +570,11 @@ cloudlogs/
   data/columns.json       generated, gitignored
   example/logs.log
   tests/
+    golden/logs.json      564-record snapshot the engine must reproduce
+    golden/columns.json
+    test_rules.py
     test_parse.py
+    test_startup.py
     test_query.py
     test_lucene.py
 ```
@@ -517,17 +644,44 @@ LAN clients cannot reach it without one of:
 
 ## 6. Testing
 
-`tests/test_parse.py`
+`tests/test_parse.py` — the engine, against small inline rulesets
 
 * double-decode (string-wrapped JSON and plain JSON)
-* envelope flatten + label pruning
-* `log` regex: level, logger, method, src_line, thread, message
-* prefix collapse `ram_*` / `information_*` → `req_*`, `service` derivation
-* pipe-field extraction and `req_*` backfill precedence
-* type coercion: `"404"` → `404`, `"true"` → `True`
+* dotted-path sources, produced columns shadowing raw keys
+* `regex` group 1 → target; named groups → several columns at once
+* `from:` list, first non-null wins
+* two rules on one column: the first to produce a value wins, the second only
+  fills a blank
+* `join` + `sep`, with a null piece dropped rather than rendered as `''`
+* casting: `"404"` → `404`, `"true"` → `True`, `"n/a"` → `None` + counted
 * malformed input: not JSON, JSON but no `log`, `log` not matching the pattern
   → row still produced with `parse_ok: false`, nothing lost
-* missing `kubernetes` key → `service: "unknown"`, k8s columns null
+* a non-JSON line arrives at the rules as `{message: <raw>}`
+* engine columns `source_file` / `parse_ok` / `_raw` present and not writable
+
+`tests/test_rules.py` — loading and validation
+
+* every validation error, each with its file, line and message: YAML syntax,
+  uncompilable regex, target not in `columns:`, unknown `type`, rule with
+  neither `target` nor named groups, `join` without `sep`, rule targeting an
+  engine column, duplicate column name
+* an unknown target suggests the nearest declared column
+* `--rules` / `CLOUDLOGS_RULES` selection, and `is_stale` reacting to the
+  rules file's mtime
+
+`tests/test_startup.py` — the server's contract around the rules file
+
+* a broken `rules.yaml` makes `load_state()` raise rather than serve past it,
+  **including when `logs.json` is fresh and nothing needs re-ingesting** —
+  otherwise the rules are never loaded and the typo is served straight past
+* the good path is unaffected: ingest runs and records load
+* `POST /api/reload` on a broken file answers **400** with the message the CLI
+  would print, and the already-loaded records keep being served — a running
+  viewer survives your typo, a starting one refuses
+
+**Golden snapshot** — `tests/golden/logs.json` + `columns.json` were produced by
+the pre-rules implementation. The shipped `rules.yaml` must reproduce them
+byte-for-byte; that test is what proves the migration lost nothing.
 
 `tests/test_lucene.py`
 

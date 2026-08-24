@@ -1,0 +1,167 @@
+# cloudlogs ingest configuration (PLAN.md 2.1).
+#
+# `columns:` is the schema -- it fixes the output order, the type used for
+# casting and any UI override. `rules:` is an ordered pipeline: rules run top
+# to bottom and a rule only writes a column that is still empty, so the first
+# rule to produce a non-null value wins and reordering the file is how you
+# change priority.
+#
+# Adding a column is one entry here plus one rule; nothing in Python changes.
+
+columns:
+  # ---- the application log line -------------------------------------------
+  - {name: time, type: time, default_visible: true}
+  - {name: app_time, type: time}
+  - {name: level, default_visible: true}
+  - {name: logger, default_visible: true}
+  - {name: method}
+  - {name: src_line, type: int, label: Source Line}
+  - {name: thread}
+  - {name: message, default_visible: true}
+
+  # ---- who produced the line ----------------------------------------------
+  - {name: service, default: unknown, default_visible: true}
+
+  # ---- the request the line describes -------------------------------------
+  - {name: req_path}
+  - {name: req_status_code, type: int, default_visible: true}
+  - {name: req_duration_ms, type: int, label: Req Duration (ms)}
+  - {name: req_host}
+  - {name: req_user_agent}
+  - {name: req_x_header, label: Req X-Forwarded-For}
+  - {name: req_trace_ids, label: Req Trace-IDs}
+  - {name: op_x_request_id, label: X-Request-ID}
+
+  # ---- kubernetes ----------------------------------------------------------
+  - {name: k8s_cluster}
+  - {name: k8s_namespace, default_visible: true}
+  - {name: k8s_pod}
+  - {name: k8s_container}
+  - {name: k8s_pod_hash}
+  - {name: k8s_version}
+  - {name: k8s_revision}
+  - {name: k8s_deployment_id}
+  - {name: k8s_instance}
+
+  # ---- the rest of the envelope -------------------------------------------
+  - {name: node_name, label: Node}
+  - {name: x_trace_id, label: X-Trace-ID}
+  - {name: has_response_payload, type: bool}
+
+  # ---- scratch columns: read by later rules, never emitted -----------------
+  # `[Logger.method:44]`, split by the `origin` rule below.
+  - {name: origin, internal: true}
+  # the message, but only when it is an operation log: `k: v | k: v | ...`.
+  # Gating on the pipe shape is what stops the per-label rules from firing on
+  # ordinary prose -- 48 plain messages start with `received response code:`
+  # and 497 mention `x-request-id:` without being operation logs at all.
+  - {name: pipe_body, internal: true}
+
+rules:
+  # ---- the envelope --------------------------------------------------------
+  - {name: time, target: time, from: time}
+  - {name: node_name, target: node_name, from: node_name}
+  - {name: x_trace_id, target: x_trace_id, from: x_trace_id}
+  - {name: has_response_payload, target: has_response_payload, from: has_response_payload}
+
+  - {name: k8s_cluster, target: k8s_cluster, from: kubernetes.cluster_name}
+  - {name: k8s_namespace, target: k8s_namespace, from: kubernetes.namespace_name}
+  - {name: k8s_pod, target: k8s_pod, from: kubernetes.pod_name}
+  - {name: k8s_container, target: k8s_container, from: kubernetes.container_name}
+  - {name: k8s_pod_hash, target: k8s_pod_hash, from: kubernetes.labels.pod-template-hash}
+  - {name: k8s_version, target: k8s_version, from: kubernetes.labels.app_kubernetes_io/version}
+  - {name: k8s_revision, target: k8s_revision, from: kubernetes.labels.app_kubernetes_io/revision}
+  - {name: k8s_deployment_id, target: k8s_deployment_id, from: kubernetes.labels.de_ibm/deployment-id}
+  - {name: k8s_instance, target: k8s_instance, from: kubernetes.labels.app_kubernetes_io/instance}
+
+  # ---- the request fields a service puts in the envelope -------------------
+  # `<service>_<suffix>`, listed in priority order. A new service is one more
+  # name in these lists. `ram_log_level` is deliberately absent: it repeats
+  # `level`.
+  - {name: req_path/envelope, target: req_path, from: [ram_path, information_path]}
+  - {name: req_status_code/envelope, target: req_status_code,  from: [ram_status_code, information_status_code]}
+  - {name: req_duration_ms/envelope, target: req_duration_ms, from: [ram_duration_ms, information_duration_ms]}
+  - {name: req_host/envelope, target: req_host, from: [ram_host, information_host]}
+  - {name: req_user_agent/envelope, target: req_user_agent, from: [ram_user_agent, information_user_agent]}
+  - {name: req_x_header/envelope, target: req_x_header, from: [ram_x_header, information_x_header]}
+
+  # ---- service, read off the container name --------------------------------
+  # Ordered: a `-ram` container only wins once the three named services have
+  # had their say. `service` falls back to its `default: unknown`.
+
+  - {name: service/security-gate, target: service, from: k8s_container, regex: '(?i)(security-gate)'}
+  - {name: service/notification, target: service, from: k8s_container, regex: '(?i)(notification)'}
+  - {name: service/information, target: service, from: k8s_container, regex: '(?i)(information)'}
+  - {name: service/ram, target: service, from: k8s_container, regex: '(?i)-(ram)(?:-|$)'}
+
+  # ---- the Quarkus log line ------------------------------------------------
+  #   2026-07-09 08:25:06 WARN  [Logger.method:44] (thread) message
+  # The optional `|` after the thread is the bare separator an operation log
+  # opens with; it is dropped, the rest of the message is untouched.
+  - name: log-line
+    required: true
+    from: log
+    regex: '(?s)^\s*(?P<app_time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+(?P<level>\S+)\s+\[(?P<origin>[^\]]*)\]\s+\((?P<thread>[^)]*)\)\s*\|?\s*(?P<message>.*)$'
+
+  # `pkg.Logger.method:44`, `Logger.method:44`, `Logger:44` or just `Logger`
+  - name: origin
+    from: origin
+    regex: '^(?P<logger>[^:]+?)(?:\.(?P<method>[^.:]+))?(?::(?P<src_line>\d+))?$'
+
+  # A line the pattern above did not match keeps its text rather than losing
+  # it: the raw `log` string, or -- for a line that was not JSON at all -- the
+  # raw text the engine handed the rules as `message`.
+  - {name: message/raw, target: message, from: [log, message]}
+
+  # ---- operation logs: `key: value | key: value | ...` ---------------------
+  # Only a message with at least two `|` is treated as pipe-structured; every
+  # rule below reads `pipe_body` rather than `message` for exactly that reason.
+  - name: pipe-body
+    target: pipe_body
+    from: message
+    regex: '(?s)^((?:[^|]*\|){2}.*)$'
+
+  - {name: pipe/path, target: req_path, from: pipe_body, regex: '(?i)(?:^|\|)\s*path\s*:\s*([^|]*)'}
+  # four spellings mean "the status code"; whichever comes first in the message
+  # wins, which is one alternation rather than four rules three of which would
+  # report themselves as never matched on every run
+  - name: pipe/status-code
+    target: req_status_code
+    from: pipe_body
+    regex: '(?i)(?:^|\|)\s*(?:response status code|received response code|status code|responsestatuscode)\s*:\s*([^|]*)'
+  - {name: pipe/duration, target: req_duration_ms, from: pipe_body, regex: '(?i)(?:^|\|)\s*time\(ms\)\s*:\s*([^|]*)'}
+  - {name: pipe/host, target: req_host, from: pipe_body, regex: '(?i)(?:^|\|)\s*host header\s*:\s*([^|]*)'}
+  - {name: pipe/user-agent, target: req_user_agent, from: pipe_body, regex: '(?i)(?:^|\|)\s*user-agent\s*:\s*([^|]*)'}
+  - {name: pipe/x-forwarded-for, target: req_x_header, from: pipe_body, regex: '(?i)(?:^|\|)\s*x-forwarded-for header\s*:\s*([^|]*)'}
+  - {name: pipe/x-request-id, target: op_x_request_id, from: pipe_body, regex: '(?i)(?:^|\|)\s*x-request-id\s*:\s*([^|]*)'}
+  - {name: pipe/has-response-payload, target: has_response_payload, from: pipe_body, regex: '(?i)(?:^|\|)\s*hasresponsepayload\s*:\s*([^|]*)'}
+  - {name: pipe/status, target: req_status_code, from: message, regex: '(?i)received (\d+) response'}
+  - {name: pipe/status, target: req_status_code, from: message, regex: '(?i)returning response code: (\d+)'}
+  - {name: pipe/status, target: req_status_code, from: message, regex: '(?i)received response code: (\d+)'}
+  - {name: pipe/status, target: req_status_code, from: message, regex: '(?i)received response with status code: (\d+)'}
+  # `all: true` keeps EVERY match, joined with `sep:` (default: one per line)
+  - {name: trace-ids, target: req_trace_ids, from: message, all: true, regex: '(?i)(\{?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}?)'}
+  
+  
+# --------------------------------------------------------------------------
+# Adding to this file
+# --------------------------------------------------------------------------
+# A new column is one `columns:` entry plus one rule. Nothing in Python changes.
+#
+#   columns:
+#     - {name: insurer, kind: facet, label: Insurer}
+#   rules:
+#     - {name: insurer, target: insurer, from: k8s_container, regex: 'pu-epa-([a-z]+)-ram'}
+#
+# A second rule on the same column only fills what the first left empty, so
+# order is priority -- put the most trustworthy source first:
+#
+#     - {name: insurer/namespace, target: insurer, from: k8s_namespace, regex: 'system-([a-z]+)-'}
+#
+# One regex can fill several columns at once via named groups, and `join`
+# glues sources together, skipping the pieces that are null:
+#
+#     - {name: pod_ref, target: pod_ref, join: [k8s_namespace, k8s_pod], sep: '/'}
+#
+# Run `python3 -m cloudlogs.ingest example/logs.log` after an edit: the report
+# says how many lines each rule contributed, and flags one that never matched.

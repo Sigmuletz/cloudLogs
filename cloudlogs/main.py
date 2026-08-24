@@ -63,10 +63,18 @@ from pydantic import BaseModel, ConfigDict, Field
 from cloudlogs import lucene, query
 
 try:  # ingest.py is written by another stage; never fatal at import time
-    from cloudlogs.ingest import ingest, is_stale  # type: ignore
+    from cloudlogs.ingest import format_summary, ingest, is_stale  # type: ignore
+    from cloudlogs.rules import RulesError, load_rules  # type: ignore
 except Exception:  # pragma: no cover - exercised only before ingest.py exists
     ingest = None  # type: ignore[assignment]
+    format_summary = None  # type: ignore[assignment]
     is_stale = None  # type: ignore[assignment]
+
+    load_rules = None  # type: ignore[assignment]
+
+    class RulesError(Exception):  # type: ignore[no-redef]
+        """Placeholder so the startup guard below still names something."""
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -171,6 +179,12 @@ def load_state(force_ingest: bool = False) -> dict[str, Any]:
     """Ingest if needed, then load records + column metadata into memory."""
     global RECORDS, COLUMNS
 
+    # Validate the ruleset first, even when nothing needs re-ingesting: a
+    # broken rules.yaml must never be served past (PLAN.md 2.7), and skipping
+    # this when logs.json happens to be fresh would do exactly that.
+    if load_rules is not None:
+        load_rules()
+
     out = data_path()
     paths = input_paths()
     summary: dict[str, Any] = {"data": str(out), "inputs": paths, "ingested": False}
@@ -192,7 +206,8 @@ def load_state(force_ingest: bool = False) -> dict[str, Any]:
             result = ingest(paths, out=out)
             summary["ingested"] = True
             summary["ingest"] = result
-            print(f"cloudlogs: ingest summary: {result}")
+            for line in format_summary(result).splitlines():
+                print(f"cloudlogs: {line}")
 
     records: list[dict] = []
     if out.exists():
@@ -234,6 +249,12 @@ def load_state(force_ingest: bool = False) -> dict[str, Any]:
 async def lifespan(_app: FastAPI):
     try:
         load_state()
+    except RulesError as exc:
+        # A broken rules.yaml is the one failure the server must not survive
+        # (PLAN.md 2.7): serving the previous logs.json would quietly show
+        # stale data that does not match the rules on disk.
+        print(f"cloudlogs: {exc}")
+        raise
     except Exception as exc:  # never let a bad workspace stop the server
         print(f"cloudlogs: startup load failed: {exc!r}")
     yield
@@ -383,6 +404,12 @@ def api_reload() -> dict:
         raise HTTPException(status_code=503, detail="cloudlogs.ingest is not available")
     try:
         return load_state(force_ingest=True)
+    except RulesError as exc:
+        # the user's typo in rules.yaml, not a server fault -- same shape as a
+        # bad query (PLAN.md 3.1): 400 with the message the CLI would print
+        raise HTTPException(
+            status_code=400, detail={"error": str(exc), "kind": "rules"}
+        ) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"reload failed: {exc}") from exc
 

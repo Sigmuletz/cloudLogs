@@ -1,212 +1,92 @@
-"""Pure line -> record parsing for cloudlogs (PLAN.md sections 2.1 - 2.4).
+"""The rule engine: one raw line + a :class:`~cloudlogs.rules.Ruleset` -> one record.
 
-No file I/O, no printing. Everything here is a plain function over strings and
-dicts so it can be unit tested in isolation.
+Pure functions over strings and dicts -- no file I/O, no printing and, by
+design, **no mapping tables**. Everything this module knows about the shape of
+a log line comes from ``rules.yaml`` (PLAN.md 2.1 - 2.9); adding a column or a
+second way of filling one is an edit to that file, never to this one.
 
-Layers (each degrades on its own, a line is never dropped):
+How one line becomes a record:
 
-    L1  decode_json_line   json.loads once, then again if the result is a str
-    L2  envelope fields + flatten_kubernetes
-    L3  parse_log_string   regex over the `log` string
-    L4  parse_pipe_fields  `key: value | key: value | ...` inside the message
+1. **Decode** (fixed, PLAN.md 2.6). ``json.loads`` once, and again when the
+   result is itself a string. A line that is not JSON -- or that decodes to
+   something other than an object -- becomes the working dict
+   ``{"message": <raw text>}`` and the rules run over it anyway, so nothing is
+   ever dropped.
+2. **Run the rules** in file order over that working dict. A rule writes only a
+   column that is still empty, so the first rule to produce a non-null value
+   wins (PLAN.md 2.4). Sources are resolved against the columns produced so far
+   first, then the decoded envelope, walking dotted paths (PLAN.md 2.3).
+3. **Cast** every written value to its column's ``type:`` with
+   :func:`cloudlogs.rules._cast` -- the same caster that validates ``default:``
+   at load time, so a value means the same thing in both places. A value that
+   will not cast becomes null and is reported (PLAN.md 2.5).
+4. **Emit** the declared non-internal columns in declaration order, then the
+   engine's own ``source_file`` and ``parse_ok``, plus ``_raw`` (PLAN.md 2.8).
 
-`parse_line` returns just the record; `parse_record` returns the record plus a
-`ParseStatus` so the ingest CLI can build its per-layer summary.
+:func:`parse_line` returns just the record; :func:`parse_record` also returns a
+:class:`ParseStatus` (which rules matched) and the cast failures, which is what
+the ingest CLI builds its report from.
 """
 
 from __future__ import annotations
 
 import json
-import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
+from .rules import ENGINE_COLUMNS, Rule, Ruleset, _cast
+
+__all__ = [
+    "ENGINE_COLUMNS",
+    "ParseResult",
+    "ParseStatus",
+    "decode_json_line",
+    "parse_line",
+    "parse_record",
+]
+
+
 # --------------------------------------------------------------------------
-# schema
+# status
 # --------------------------------------------------------------------------
-
-#: every emitted record carries exactly these keys, in this order (missing
-#: values are ``None``) so the table/column metadata is stable across files.
-FIELDS: tuple[str, ...] = (
-    "time",
-    "app_time",
-    "level",
-    "logger",
-    "method",
-    "src_line",
-    "thread",
-    "message",
-    "service",
-    "req_path",
-    "req_status_code",
-    "req_duration_ms",
-    "req_host",
-    "req_user_agent",
-    "req_x_header",
-    "op_x_request_id",
-    "k8s_cluster",
-    "k8s_namespace",
-    "k8s_pod",
-    "k8s_container",
-    "k8s_pod_hash",
-    "k8s_version",
-    "k8s_revision",
-    "k8s_deployment_id",
-    "k8s_instance",
-    "node_name",
-    "x_trace_id",
-    "has_response_payload",
-    "source_file",
-    "parse_ok",
-)
-
-#: envelope keys that carry no information of their own (PLAN.md 2.2)
-DROPPED_ENVELOPE_KEYS = frozenset({"_p", "stream", "file", "tag"})
-
-#: kubernetes labels that are single-valued in practice (PLAN.md 2.2)
-DROPPED_LABELS = frozenset(
-    {
-        "app_kubernetes_io/component",
-        "app_kubernetes_io/part-of",
-        "de_ibm/product-id",
-        "helm_sh/chart",
-        # duplicates kubernetes.container_name
-        "app_kubernetes_io/name",
-    }
-)
-
-#: `ram_<suffix>` / `information_<suffix>` -> `req_<suffix>` (PLAN.md 2.4).
-#: `log_level` is intentionally not collapsed: it always repeats `level`.
-PREFIXES = ("ram", "information")
-PREFIX_SUFFIXES = (
-    "path",
-    "status_code",
-    "duration_ms",
-    "host",
-    "user_agent",
-    "x_header",
-)
-
-#: pipe-field key (lowercased) -> record field (PLAN.md 2.3)
-PIPE_FIELD_MAP = {
-    "path": "req_path",
-    "response status code": "req_status_code",
-    "time(ms)": "req_duration_ms",
-    "host header": "req_host",
-    "user-agent": "req_user_agent",
-    "x-forwarded-for header": "req_x_header",
-    "x-request-id": "op_x_request_id",
-    "hasresponsepayload": "has_response_payload",
-}
-
-#: fields that are always integers
-INT_FIELDS = frozenset({"src_line", "req_status_code", "req_duration_ms"})
-#: fields that are always booleans
-BOOL_FIELDS = frozenset({"has_response_payload"})
-
-LOG_PATTERN = re.compile(
-    r"^(?P<app_time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+"
-    r"(?P<level>\S+)\s+"
-    r"\[(?P<origin>[^\]]*)\]\s+"
-    r"\((?P<thread>[^)]*)\)\s*"
-    r"(?P<message>.*)$",
-    re.DOTALL,
-)
-
-#: `Logger.method:44`, `pkg.Logger.method:44`, `Logger:44` or just `Logger`
-ORIGIN_PATTERN = re.compile(
-    r"^(?P<logger>[^:]+?)(?:\.(?P<method>[^.:]+))?(?::(?P<line>\d+))?$"
-)
-
-PIPE_FIELD_PATTERN = re.compile(r"^(?P<key>[A-Za-z][A-Za-z0-9 _.()\-]{0,40}):\s?(?P<value>.*)$", re.DOTALL)
 
 
 @dataclass
 class ParseStatus:
-    """Which layers succeeded for one line."""
+    """What happened to one line: did it decode, and which rules matched.
+
+    ``rule_hits`` holds the *name* of every rule whose source matched -- for a
+    ``regex:`` rule that its pattern matched, for a plain ``from:`` rule that
+    one of its sources held a value. A rule can hit without writing anything,
+    because an earlier rule may already have filled the column; that is the
+    distinction the per-rule report in ``ingest.py`` is built on.
+    """
 
     json_ok: bool = False
-    log_ok: bool = False
-    pipe_ok: bool = False
+    rule_hits: set[str] = field(default_factory=set)
+    #: rules that actually stored a value -- a subset of ``rule_hits``
+    rule_writes: set[str] = field(default_factory=set)
+    #: names of the rules marked ``required:`` in the ruleset that produced this
+    required: frozenset[str] = frozenset()
 
     @property
     def parse_ok(self) -> bool:
-        """A record is 'ok' when the envelope decoded and the log line matched."""
-        return self.json_ok and self.log_ok
+        """True when the JSON decoded *and* every required rule matched."""
+        return self.json_ok and self.required.issubset(self.rule_hits)
 
 
 @dataclass
 class ParseResult:
-    """A normalized record plus the per-layer status that produced it."""
+    """A record, the status that produced it, and any value that would not cast."""
 
     record: dict[str, Any]
     status: ParseStatus
+    #: ``(column, offending value)`` per failed cast, for the ingest summary
+    cast_failures: tuple[tuple[str, Any], ...] = ()
 
 
 # --------------------------------------------------------------------------
-# coercion helpers -- these must never raise
-# --------------------------------------------------------------------------
-
-
-def to_int(value: Any) -> Any:
-    """Best-effort int. Returns the original value when it is not int-like."""
-    if value is None or isinstance(value, bool):
-        return value
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value) if value.is_integer() else value
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return None
-        try:
-            return int(text)
-        except ValueError:
-            try:
-                number = float(text)
-            except ValueError:
-                return value
-            return int(number) if number.is_integer() else number
-    return value
-
-
-def to_bool(value: Any) -> Any:
-    """Best-effort bool for "true"/"false". Unknown input is returned as-is."""
-    if value is None or isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        text = value.strip().lower()
-        if text in ("true", "yes", "1"):
-            return True
-        if text in ("false", "no", "0"):
-            return False
-        if text in ("", "null", "none"):
-            return None
-    return value
-
-
-def coerce_field(name: str, value: Any) -> Any:
-    """Apply the coercion configured for `name` (int / bool / passthrough)."""
-    if name in INT_FIELDS:
-        return to_int(value)
-    if name in BOOL_FIELDS:
-        return to_bool(value)
-    return value
-
-
-def _clean(value: Any) -> Any:
-    """Normalize placeholder strings ("", "null") to None."""
-    if isinstance(value, str):
-        text = value.strip()
-        if text == "" or text.lower() == "null":
-            return None
-        return text
-    return value
-
-
-# --------------------------------------------------------------------------
-# L1 -- decode
+# L1 -- decode (fixed, PLAN.md 2.6)
 # --------------------------------------------------------------------------
 
 
@@ -233,226 +113,187 @@ def decode_json_line(raw: str) -> tuple[Any, bool]:
 
 
 # --------------------------------------------------------------------------
-# L2 -- envelope
+# values
 # --------------------------------------------------------------------------
 
 
-def flatten_kubernetes(kubernetes: Any) -> dict[str, Any]:
-    """Flatten the nested `kubernetes` object into `k8s_*` fields.
+def _clean(value: Any) -> Any:
+    """Strip a string and turn the placeholders ``""`` and ``"null"`` into None.
 
-    Unknown/absent input yields all-None values; single-valued labels are
-    pruned (PLAN.md 2.2).
+    Applied to every value on its way into a column, before casting -- a
+    ``null`` that arrived as text is an absent value, not the word.
     """
-    flat: dict[str, Any] = {
-        "k8s_cluster": None,
-        "k8s_namespace": None,
-        "k8s_pod": None,
-        "k8s_container": None,
-        "k8s_pod_hash": None,
-        "k8s_version": None,
-        "k8s_revision": None,
-        "k8s_deployment_id": None,
-        "k8s_instance": None,
-    }
-    if not isinstance(kubernetes, dict):
-        return flat
-    flat["k8s_cluster"] = _clean(kubernetes.get("cluster_name"))
-    flat["k8s_namespace"] = _clean(kubernetes.get("namespace_name"))
-    flat["k8s_pod"] = _clean(kubernetes.get("pod_name"))
-    flat["k8s_container"] = _clean(kubernetes.get("container_name"))
-
-    labels = kubernetes.get("labels")
-    if isinstance(labels, dict):
-        keep = {k: v for k, v in labels.items() if k not in DROPPED_LABELS}
-        flat["k8s_pod_hash"] = _clean(keep.get("pod-template-hash"))
-        flat["k8s_version"] = _clean(keep.get("app_kubernetes_io/version"))
-        flat["k8s_revision"] = _clean(keep.get("app_kubernetes_io/revision"))
-        flat["k8s_deployment_id"] = _clean(keep.get("de_ibm/deployment-id"))
-        flat["k8s_instance"] = _clean(keep.get("app_kubernetes_io/instance"))
-    return flat
+    if isinstance(value, str):
+        text = value.strip()
+        if text == "" or text.lower() == "null":
+            return None
+        return text
+    return value
 
 
-def collapse_prefixes(envelope: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
-    """Collapse `ram_*` / `information_*` envelope keys into `req_*`.
+def _resolve(name: str, values: dict[str, Any], envelope: Any) -> Any:
+    """Read source ``name`` out of the working namespace (PLAN.md 2.3).
 
-    Returns ``(req_fields, prefix)`` where `prefix` is the prefix that supplied
-    the values (``"ram"``, ``"information"`` or ``None``).
+    A column an earlier rule filled shadows a raw key of the same name; a name
+    that is not a filled column is looked up in the decoded envelope, first
+    whole (so a top-level key may contain a literal dot) and then as a dotted
+    path walking nested mappings.
     """
-    req: dict[str, Any] = {f"req_{suffix}": None for suffix in PREFIX_SUFFIXES}
-    found: str | None = None
-    for prefix in PREFIXES:
-        present = [s for s in PREFIX_SUFFIXES if f"{prefix}_{s}" in envelope]
-        if not present:
+    produced = values.get(name)
+    if produced is not None:
+        return produced
+    node: Any = envelope
+    if isinstance(node, dict) and name in node:
+        return node[name]
+    for part in name.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+class _Writer:
+    """Writes cast values into the columns of one record, first non-null wins."""
+
+    def __init__(self, ruleset: Ruleset) -> None:
+        self.types = {column.name: column.type for column in ruleset.columns}
+        self.values: dict[str, Any] = {column.name: None for column in ruleset.columns}
+        self.failures: list[tuple[str, Any]] = []
+
+    def write(self, column: str, value: Any) -> bool:
+        """Clean, cast and store ``value``; False when nothing was stored.
+
+        A column that is already filled keeps what it has -- first non-null
+        wins (PLAN.md 2.4) -- and the caller is told so it can tell a rule
+        that contributed nothing from one that never matched at all.
+        """
+        if self.values.get(column) is not None:
+            return False
+        cleaned = _clean(value)
+        if cleaned is None:
+            return False
+        ok, cast = _cast(cleaned, self.types.get(column, "str"))
+        if not ok:
+            self.failures.append((column, cleaned))
+            return False
+        if cast is None:
+            return False
+        self.values[column] = cast
+        return True
+
+
+# --------------------------------------------------------------------------
+# one rule
+# --------------------------------------------------------------------------
+
+
+def _apply(rule: Rule, writer: _Writer, envelope: Any) -> tuple[bool, bool]:
+    """Run one rule; ``(matched, wrote)``.
+
+    The two differ for a rule whose column an earlier rule already filled: it
+    matched, but contributed nothing. The report distinguishes them, because
+    "never matched" and "always shadowed" are different mistakes.
+    """
+    if rule.join:
+        pieces = [
+            _clean(_resolve(source, writer.values, envelope)) for source in rule.join
+        ]
+        kept = [p if isinstance(p, str) else str(p) for p in pieces if p is not None]
+        if not kept:
+            return False, False
+        wrote = rule.target is not None and writer.write(rule.target, rule.sep.join(kept))
+        return True, wrote
+
+    if rule.pattern is not None and rule.all_matches:
+        # every match, not only the first, joined with `sep` (PLAN.md 2.2)
+        for source in rule.sources:
+            text = _resolve(source, writer.values, envelope)
+            if not isinstance(text, str):
+                continue
+            found = [
+                match.group(1) if rule.pattern.groups else match.group(0)
+                for match in rule.pattern.finditer(text)
+            ]
+            kept = [value.strip() for value in found if value and value.strip()]
+            if not kept:
+                continue
+            wrote = rule.target is not None and writer.write(
+                rule.target, rule.sep.join(kept)
+            )
+            return True, wrote
+        return False, False
+
+    if rule.pattern is not None:
+        for source in rule.sources:
+            text = _resolve(source, writer.values, envelope)
+            if not isinstance(text, str):
+                continue
+            match = rule.pattern.search(text)
+            if match is None:
+                continue
+            wrote = False
+            if rule.target is not None:
+                wrote = writer.write(
+                    rule.target,
+                    match.group(1) if rule.pattern.groups else match.group(0),
+                )
+            for group in rule.groups:
+                captured = match.group(group)
+                if captured is not None:  # a group that did not participate
+                    wrote = writer.write(group, captured) or wrote
+            return True, wrote
+        return False, False
+
+    for source in rule.sources:
+        value = _resolve(source, writer.values, envelope)
+        if _clean(value) is None:
             continue
-        found = found or prefix
-        for suffix in present:
-            name = f"req_{suffix}"
-            if req[name] is None:
-                req[name] = coerce_field(name, _clean(envelope[f"{prefix}_{suffix}"]))
-    return req, found
-
-
-def derive_service(prefix: str | None, container: str | None, has_kubernetes: bool) -> str:
-    """Service name per PLAN.md 2.4."""
-    if prefix:
-        return prefix
-    if not has_kubernetes:
-        return "unknown"
-    name = (container or "").lower()
-    if "security-gate" in name:
-        return "security-gate"
-    if "notification" in name:
-        return "notification"
-    if "information" in name:
-        return "information"
-    if name.endswith("-ram") or "-ram-" in name:
-        return "ram"
-    return "unknown"
+        wrote = rule.target is not None and writer.write(rule.target, value)
+        return True, wrote
+    return False, False
 
 
 # --------------------------------------------------------------------------
-# L3 -- the `log` string
+# one line
 # --------------------------------------------------------------------------
 
 
-def parse_log_string(log: Any) -> dict[str, Any] | None:
-    """Split a Quarkus log line into its parts, or None when it does not match.
-
-    ``2026-07-09 08:25:06 WARN  [Logger.method:44] (thread) message``
-    """
-    if not isinstance(log, str):
-        return None
-    match = LOG_PATTERN.match(log.strip())
-    if not match:
-        return None
-    origin = ORIGIN_PATTERN.match(match.group("origin") or "")
-    logger = method = src_line = None
-    if origin:
-        logger = _clean(origin.group("logger"))
-        method = _clean(origin.group("method"))
-        src_line = to_int(origin.group("line"))
-    message = match.group("message").strip()
-    # operation-log lines start with a bare separator: `(thread) | path: ...`
-    if message.startswith("|"):
-        message = message[1:].strip()
-    return {
-        "app_time": _clean(match.group("app_time")),
-        "level": _clean(match.group("level")),
-        "logger": logger,
-        "method": method,
-        "src_line": src_line,
-        "thread": _clean(match.group("thread")),
-        "message": message,
-    }
-
-
-# --------------------------------------------------------------------------
-# L4 -- pipe fields
-# --------------------------------------------------------------------------
-
-
-def parse_pipe_fields(message: Any) -> dict[str, str]:
-    """Extract `key: value | key: value | ...` pairs from a message.
-
-    Only returns something when at least two pipe-separated segments look like
-    key/value pairs, so ordinary prose containing a colon is left alone.
-    """
-    if not isinstance(message, str) or "|" not in message:
-        return {}
-    fields: dict[str, str] = {}
-    for segment in message.split("|"):
-        segment = segment.strip()
-        if not segment:
-            continue
-        match = PIPE_FIELD_PATTERN.match(segment)
-        if not match:
-            continue
-        key = match.group("key").strip().lower()
-        if key in PIPE_FIELD_MAP:
-            fields[key] = match.group("value").strip()
-    return fields if len(fields) >= 2 else {}
-
-
-def apply_pipe_fields(record: dict[str, Any], fields: dict[str, str]) -> None:
-    """Backfill `req_*` from pipe fields, in place.
-
-    `x-request-id` always lands in `op_x_request_id`; everything else only
-    fills a field that is still empty (PLAN.md 2.3).
-    """
-    for key, value in fields.items():
-        name = PIPE_FIELD_MAP[key]
-        cleaned = coerce_field(name, _clean(value))
-        if name == "op_x_request_id":
-            record[name] = cleaned
-        elif record.get(name) is None:
-            record[name] = cleaned
-
-
-# --------------------------------------------------------------------------
-# top level
-# --------------------------------------------------------------------------
-
-
-def empty_record(source_file: str) -> dict[str, Any]:
-    """A record with every field present and empty."""
-    record: dict[str, Any] = {name: None for name in FIELDS}
-    record["source_file"] = source_file
-    record["parse_ok"] = False
-    return record
-
-
-def parse_record(raw: str, source_file: str) -> ParseResult:
-    """Parse one raw line into a record plus its per-layer `ParseStatus`."""
-    status = ParseStatus()
-    record = empty_record(source_file)
-    record["service"] = "unknown"
-
-    decoded, status.json_ok = decode_json_line(raw)
-    if not status.json_ok or not isinstance(decoded, dict):
-        # L1 failed (or the payload is not an object): keep everything raw.
-        record["message"] = decoded if isinstance(decoded, str) else raw.strip()
-        record["_raw"] = decoded if status.json_ok else raw.rstrip("\n")
-        record["parse_ok"] = status.parse_ok
-        return ParseResult(record, status)
-
-    envelope = {k: v for k, v in decoded.items() if k not in DROPPED_ENVELOPE_KEYS}
-
-    # L2 -- envelope
-    record["time"] = _clean(envelope.get("time"))
-    record["node_name"] = _clean(envelope.get("node_name"))
-    record["x_trace_id"] = _clean(envelope.get("x_trace_id"))
-    if "has_response_payload" in envelope:
-        record["has_response_payload"] = to_bool(_clean(envelope["has_response_payload"]))
-    record.update(flatten_kubernetes(envelope.get("kubernetes")))
-
-    req_fields, prefix = collapse_prefixes(envelope)
-    record.update(req_fields)
-    record["service"] = derive_service(
-        prefix, record["k8s_container"], isinstance(envelope.get("kubernetes"), dict)
+def parse_record(raw: str, source_file: str, ruleset: Ruleset) -> ParseResult:
+    """Parse one raw line into a record plus the status that produced it."""
+    status = ParseStatus(
+        required=frozenset(rule.name for rule in ruleset.rules if rule.required)
     )
+    decoded, status.json_ok = decode_json_line(raw)
 
-    # L3 -- the application log line
-    log = envelope.get("log")
-    parsed = parse_log_string(log)
-    if parsed is not None:
-        status.log_ok = True
-        record.update(parsed)
-    elif isinstance(log, str):
-        record["message"] = log.strip()
+    if status.json_ok and isinstance(decoded, dict):
+        envelope: Any = decoded
+        raw_value: Any = decoded
     else:
-        record["message"] = raw.strip()
+        # not JSON, or JSON that is not an object: hand the text to the rules
+        # as `message` so a plain-text format is a regex rule, not new code.
+        text = decoded if isinstance(decoded, str) else raw.strip()
+        envelope = {"message": text}
+        raw_value = decoded if status.json_ok else raw.rstrip("\n")
 
-    # L4 -- pipe fields inside the message
-    fields = parse_pipe_fields(record["message"])
-    if fields:
-        status.pipe_ok = True
-        apply_pipe_fields(record, fields)
+    writer = _Writer(ruleset)
+    for rule in ruleset.rules:
+        matched, wrote = _apply(rule, writer, envelope)
+        if matched:
+            status.rule_hits.add(rule.name)
+        if wrote:
+            status.rule_writes.add(rule.name)
 
+    for column in ruleset.columns:
+        if writer.values[column.name] is None and column.default is not None:
+            writer.values[column.name] = column.default
+
+    record = {column.name: writer.values[column.name] for column in ruleset.output_columns}
+    record["source_file"] = source_file
     record["parse_ok"] = status.parse_ok
-    record["_raw"] = decoded
-    return ParseResult(record, status)
+    record["_raw"] = raw_value
+    return ParseResult(record, status, tuple(writer.failures))
 
 
-def parse_line(raw: str, source_file: str) -> dict[str, Any]:
-    """Parse one raw log line into a normalized record (PLAN.md 2.2)."""
-    return parse_record(raw, source_file).record
+def parse_line(raw: str, source_file: str, ruleset: Ruleset) -> dict[str, Any]:
+    """Parse one raw log line into a normalized record."""
+    return parse_record(raw, source_file, ruleset).record

@@ -2,24 +2,31 @@
 
     python -m cloudlogs.ingest example/logs.log
     python -m cloudlogs.ingest 'logs/**/*.log' -o data/all.json
-    python -m cloudlogs.ingest logdir/            # recurses *.log
+    python -m cloudlogs.ingest logdir/                  # recurses *.log
+    python -m cloudlogs.ingest logs.log --rules experiments.yaml
+
+What each line becomes is declared in `rules.yaml`, not here: this module owns
+the file walking, the column metadata and the report (PLAN.md 2.10 - 2.12).
 
 Reusable API (used by `cloudlogs.main` to ingest on startup):
 
-    ingest(paths, out=Path("data/logs.json")) -> dict
+    ingest(paths, out=Path("data/logs.json"), rules=None) -> dict
         Parse every input into `out`, write column metadata next to it as
         `columns.json`, and return a summary dict:
         {"files": [str], "lines": int, "records": int, "json_ok": int,
-         "log_ok": int, "pipe_ok": int, "failed": int, "columns": int,
-         "out": str, "columns_path": str}
+         "rules": [{"name", "required", "hits", "writes"}], "cast_failures": [...],
+         "failed": int, "columns": int, "out": str, "columns_path": str,
+         "rules_path": str}
+        `rules` takes a path or an already loaded `Ruleset`; None means the
+        default `rules.yaml` (or `$CLOUDLOGS_RULES`).
 
-    is_stale(out, paths) -> bool
-        True when `out` is missing or older than any of the resolved inputs,
-        i.e. when ingest should run again. `paths` takes the same
-        files/globs/directories the CLI accepts.
+    is_stale(out, paths, rules=None) -> bool
+        True when `out` is missing or older than any of the resolved inputs
+        **or than the rules file**, i.e. when ingest should run again. `paths`
+        takes the same files/globs/directories the CLI accepts.
 
     format_summary(summary) -> str
-        The per-layer report printed by the CLI (PLAN.md 2.1).
+        The per-rule report printed by the CLI (PLAN.md 2.11).
 """
 
 from __future__ import annotations
@@ -28,51 +35,31 @@ import argparse
 import glob as globlib
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from .parse import FIELDS, parse_record
+from .parse import parse_record
+from .rules import ENGINE_COLUMNS, Column, Ruleset, RulesError, find_rules_path, load_rules
 
 DEFAULT_OUT = Path("data/logs.json")
 COLUMNS_NAME = "columns.json"
 
-#: `facet` when a column has at most this many distinct values (PLAN.md 2.5)
+#: `facet` when a column has at most this many distinct values (PLAN.md 2.10)
 FACET_MAX_DISTINCT = 200
 
 #: a numeric column with at most this many distinct values is still a checkbox
 #: facet (status codes, ports); above it, a min/max range makes more sense
 FACET_MAX_NUMERIC_DISTINCT = 25
 
-#: rendered as a from/to range
-TIME_COLUMNS = frozenset({"time", "app_time"})
-
-#: table columns shown by default (PLAN.md 4.3)
-DEFAULT_VISIBLE = (
-    "time",
-    "level",
-    "service",
-    "k8s_namespace",
-    "logger",
-    "req_status_code",
-    "message",
-)
-
-#: filter cards the panel opens with (PLAN.md 4.2)
+#: filter cards the panel opens with (PLAN.md 4.2). Unlike `default_visible`,
+#: which every column declares for itself in `rules.yaml`, this is not part of
+#: the column schema `rules.py` accepts, so it stays here.
 DEFAULT_FILTERS = ("level", "logger", "service", "k8s_namespace", "req_status_code")
 
-#: deterministic column order so the UI never shuffles between runs
-COLUMN_ORDER = FIELDS
-
-#: nicer labels than the generic prettifier produces
+#: labels for the engine's own columns; a declared column says `label:` in
+#: `rules.yaml` when the generic prettifier is not good enough
 LABEL_OVERRIDES = {
-    "time": "Time",
-    "app_time": "App Time",
-    "src_line": "Source Line",
-    "op_x_request_id": "X-Request-ID",
-    "x_trace_id": "X-Trace-ID",
-    "req_x_header": "Req X-Forwarded-For",
-    "req_duration_ms": "Req Duration (ms)",
-    "node_name": "Node",
     "source_file": "Source File",
     "parse_ok": "Parse OK",
 }
@@ -130,23 +117,54 @@ def source_label(path: Path) -> str:
         return str(path)
 
 
-def is_stale(out: str | os.PathLike[str], paths: Iterable[str | os.PathLike[str]]) -> bool:
-    """True when `out` is missing or older than any input (so ingest should run)."""
+def resolve_ruleset(rules: str | os.PathLike[str] | Ruleset | None = None) -> Ruleset:
+    """Accept a `Ruleset`, a path, or None (the default `rules.yaml`)."""
+    if isinstance(rules, Ruleset):
+        return rules
+    return load_rules(rules)
+
+
+def _rules_path(rules: str | os.PathLike[str] | Ruleset | None) -> Path | None:
+    """Where the rules live, or None when they cannot be located at all."""
+    if isinstance(rules, Ruleset):
+        return rules.path
+    try:
+        return find_rules_path(rules)
+    except RulesError:
+        return None
+
+
+def is_stale(
+    out: str | os.PathLike[str],
+    paths: Iterable[str | os.PathLike[str]],
+    rules: str | os.PathLike[str] | Ruleset | None = None,
+) -> bool:
+    """True when `out` is missing or older than any input, or than `rules.yaml`.
+
+    Editing an extraction rule changes the output just as much as a new log
+    file does, so the rules file counts as an input (PLAN.md 2.1).
+    """
     out_path = Path(out)
     if not out_path.exists():
         return True
     columns_path = out_path.with_name(COLUMNS_NAME)
     if not columns_path.exists():
         return True
+    out_mtime = min(out_path.stat().st_mtime, columns_path.stat().st_mtime)
+
+    rules_path = _rules_path(rules)
+    if rules_path is not None and rules_path.is_file():
+        if rules_path.stat().st_mtime > out_mtime:
+            return True
+
     inputs = expand_inputs(paths)
     if not inputs:
         return False
-    out_mtime = min(out_path.stat().st_mtime, columns_path.stat().st_mtime)
     return any(source.stat().st_mtime > out_mtime for source in inputs)
 
 
 # --------------------------------------------------------------------------
-# column metadata (PLAN.md 2.5)
+# column metadata (PLAN.md 2.10)
 # --------------------------------------------------------------------------
 
 
@@ -160,10 +178,10 @@ def prettify(name: str) -> str:
     return " ".join(words)
 
 
-def classify(name: str, values: list[Any]) -> tuple[str, bool, int]:
+def classify(name: str, values: list[Any], type_: str = "str") -> tuple[str, bool, int]:
     """Return `(kind, numeric, distinct)` for one column.
 
-    `time` columns first, then numeric columns with many distinct values
+    `type: time` columns first, then numeric columns with many distinct values
     (min/max inputs), then anything with few enough distinct values (checkbox
     facet), else free text. A low-cardinality numeric column such as
     `req_status_code` stays a facet -- ticking 404 and 503 is what you want
@@ -173,7 +191,7 @@ def classify(name: str, values: list[Any]) -> tuple[str, bool, int]:
     numeric = bool(values) and all(
         isinstance(v, (int, float)) and not isinstance(v, bool) for v in values
     )
-    if name in TIME_COLUMNS:
+    if type_ == "time":
         kind = "time"
     elif numeric and distinct > FACET_MAX_NUMERIC_DISTINCT:
         kind = "number"
@@ -184,28 +202,36 @@ def classify(name: str, values: list[Any]) -> tuple[str, bool, int]:
     return kind, numeric, distinct
 
 
-def build_columns(records: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Build `columns.json` metadata for every column except `_raw`."""
-    present: list[str] = [name for name in COLUMN_ORDER]
-    extra = sorted(
-        {key for record in records for key in record}
-        - set(present)
-        - {"_raw"}
-    )
+def build_columns(
+    records: Sequence[dict[str, Any]], ruleset: Ruleset | None = None
+) -> list[dict[str, Any]]:
+    """Build `columns.json` metadata for every column except `_raw`.
+
+    Order, type and any UI override come from `rules.yaml`; `kind`, `numeric`
+    and `distinct` are measured off the records unless the column declared a
+    `kind:` of its own.
+    """
+    declared: tuple[Column, ...] = ruleset.output_columns if ruleset is not None else ()
+    by_name = {column.name: column for column in declared}
+
+    present: list[str] = [column.name for column in declared]
+    present.extend(name for name in ENGINE_COLUMNS if name not in by_name)
+    extra = sorted({key for record in records for key in record} - set(present) - {"_raw"})
     present.extend(extra)
 
     columns: list[dict[str, Any]] = []
     for name in present:
+        column = by_name.get(name)
         values = [record[name] for record in records if record.get(name) is not None]
-        kind, numeric, distinct = classify(name, values)
+        kind, numeric, distinct = classify(name, values, column.type if column else "str")
         columns.append(
             {
                 "name": name,
-                "kind": kind,
-                "label": prettify(name),
+                "kind": column.kind if column is not None and column.kind else kind,
+                "label": column.label if column is not None and column.label else prettify(name),
                 "distinct": distinct,
                 "numeric": numeric,
-                "default_visible": name in DEFAULT_VISIBLE,
+                "default_visible": bool(column.default_visible) if column is not None else False,
                 "default_filter": name in DEFAULT_FILTERS,
             }
         )
@@ -220,33 +246,58 @@ def build_columns(records: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
 def ingest(
     paths: Iterable[str | os.PathLike[str]],
     out: str | os.PathLike[str] = DEFAULT_OUT,
+    rules: str | os.PathLike[str] | Ruleset | None = None,
 ) -> dict[str, Any]:
     """Parse every input file into `out` and write `columns.json` beside it.
 
-    Returns the per-layer summary dict documented at the top of this module.
+    Returns the summary dict documented at the top of this module. The ruleset
+    is loaded once and handed to every line.
     """
+    ruleset = resolve_ruleset(rules)
     out_path = Path(out)
     columns_path = out_path.with_name(COLUMNS_NAME)
     files = expand_inputs(paths)
 
     records: list[dict[str, Any]] = []
-    lines = json_ok = log_ok = pipe_ok = failed = 0
+    lines = json_ok = failed = 0
+    hits: dict[str, int] = {rule.name: 0 for rule in ruleset.rules}
+    writes: dict[str, int] = {rule.name: 0 for rule in ruleset.rules}
+    failures: dict[str, dict[str, Any]] = {}
 
     for path in files:
         label = source_label(path)
         with path.open("r", encoding="utf-8", errors="replace") as handle:
-            for raw in handle:
+            for number, raw in enumerate(handle, start=1):
                 if not raw.strip():
                     continue
                 lines += 1
-                result = parse_record(raw, label)
+                result = parse_record(raw, label, ruleset)
                 records.append(result.record)
                 json_ok += result.status.json_ok
-                log_ok += result.status.log_ok
-                pipe_ok += result.status.pipe_ok
                 failed += not result.status.parse_ok
+                for name in result.status.rule_hits:
+                    if name in hits:
+                        hits[name] += 1
+                for name in result.status.rule_writes:
+                    if name in writes:
+                        writes[name] += 1
+                for column, value in result.cast_failures:
+                    entry = failures.setdefault(
+                        column,
+                        {
+                            "column": column,
+                            "type": next(
+                                (c.type for c in ruleset.columns if c.name == column), "str"
+                            ),
+                            "count": 0,
+                            "example": value,
+                            "file": label,
+                            "line": number,
+                        },
+                    )
+                    entry["count"] += 1
 
-    columns = build_columns(records)
+    columns = build_columns(records, ruleset)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as handle:
@@ -254,31 +305,81 @@ def ingest(
     with columns_path.open("w", encoding="utf-8") as handle:
         json.dump(columns, handle, ensure_ascii=False, indent=2)
 
+    seen: set[str] = set()
+    rule_rows: list[dict[str, Any]] = []
+    for rule in ruleset.rules:
+        if rule.name in seen:
+            continue
+        seen.add(rule.name)
+        rule_rows.append(
+            {
+                "name": rule.name,
+                "required": rule.required,
+                "hits": hits[rule.name],
+                "writes": writes[rule.name],
+            }
+        )
+
     return {
         "files": [source_label(p) for p in files],
         "lines": lines,
         "records": len(records),
         "json_ok": json_ok,
-        "log_ok": log_ok,
-        "pipe_ok": pipe_ok,
+        "rules": rule_rows,
+        "cast_failures": list(failures.values()),
         "failed": failed,
         "columns": len(columns),
         "out": str(out_path),
         "columns_path": str(columns_path),
+        "rules_path": str(ruleset.path),
     }
 
 
 def format_summary(summary: dict[str, Any]) -> str:
-    """The per-layer report of PLAN.md 2.1."""
-    width = max(len(str(summary[k])) for k in ("lines", "json_ok", "log_ok", "pipe_ok", "failed"))
-    rows = [
-        ("json ok", summary["json_ok"]),
-        ("log-pattern ok", summary["log_ok"]),
-        ("pipe-fields ok", summary["pipe_ok"]),
-        ("parse_ok=false", summary["failed"]),
-    ]
+    """The per-rule report of PLAN.md 2.11.
+
+    The count is what a rule *contributed*, not merely what it matched, and two
+    kinds of idle rule are flagged apart (PLAN.md 2.11). A rule that never
+    matched carries ``⚠``: it is probably a mistake, and nothing else reveals
+    it. A rule that matched but always lost to an earlier one carries a plain
+    ``·``: a fallback that this input never needed is doing its job.
+    """
+    rows: list[tuple[str, str, int, str]] = [("json ok", "", summary["json_ok"], "")]
+    for rule in summary.get("rules", ()):
+        wrote = rule.get("writes", rule["hits"])
+        if not rule["hits"]:
+            note = "  ⚠ never matched"
+        elif not wrote:
+            note = f"  · matched {rule['hits']}, never needed"
+        else:
+            note = ""
+        rows.append(
+            (
+                rule["name"],
+                "required" if rule["required"] else "",
+                wrote,
+                note,
+            )
+        )
+    rows.append(("parse_ok=false", "", summary["failed"], ""))
+
+    name_width = max(15, *(len(name) for name, _, _, _ in rows))
+    count_width = max(7, *(len(str(count)) for _, _, count, _ in rows))
+
     lines = [f"{summary['lines']} lines → {summary['records']} records"]
-    lines += [f"  {label:<16}{value:>{width}}" for label, value in rows]
+    lines += [
+        f"  {name:<{name_width}}{mark:<8}{count:>{count_width}}{note}"
+        for name, mark, count, note in rows
+    ]
+    for failure in summary.get("cast_failures", ()):
+        where = f" (line {failure['line']}" + (
+            f" of {failure['file']})" if len(summary.get("files", ())) > 1 else ")"
+        )
+        lines.append(
+            f"  ⚠ {failure['column']}: {failure['count']} value"
+            f"{'' if failure['count'] == 1 else 's'} could not cast to "
+            f"{failure['type']}, e.g. {failure['example']!r}{where}"
+        )
     lines.append(
         f"  → {summary['out']} ({summary['columns']} columns → {summary['columns_path']})"
     )
@@ -303,13 +404,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=str(DEFAULT_OUT),
         help=f"output JSON file (default: {DEFAULT_OUT}); columns.json is written next to it",
     )
+    parser.add_argument(
+        "--rules",
+        default=None,
+        metavar="PATH",
+        help=(
+            "the columns + extraction rules to use (default: rules.yaml next to the "
+            "project root, or $CLOUDLOGS_RULES)"
+        ),
+    )
     args = parser.parse_args(argv)
+
+    try:
+        ruleset = load_rules(args.rules)
+    except RulesError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
     files = expand_inputs(args.inputs)
     if not files:
         parser.error(f"no log files matched: {' '.join(args.inputs)}")
 
-    summary = ingest(files, args.out)
+    summary = ingest(files, args.out, rules=ruleset)
     print(format_summary(summary))
     return 0
 

@@ -23,14 +23,42 @@ fi
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 
-# Report every address the viewer will actually answer on.
+# Report every address the viewer will actually answer on. Under WSL2 in its
+# default NAT mode the distro's own IP is reachable from the Windows host but
+# NOT from the LAN, so printing it as if it were a LAN address is a lie -- say
+# what is actually needed instead.
 echo "cloudlogs: http://localhost:${PORT}"
 if [ "$HOST" != "127.0.0.1" ] && [ "$HOST" != "localhost" ]; then
-    lan_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-    [ -n "${lan_ip:-}" ] && echo "cloudlogs: http://${lan_ip}:${PORT}"
-    if grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
-        echo "cloudlogs: running under WSL -- from Windows use http://localhost:${PORT}"
-        echo "           (if that fails, use the address above, or see PLAN.md)"
+    ips="$(hostname -I 2>/dev/null || true)"
+    lan_ip="$(printf '%s\n' $ips | awk '{print $1}' | head -1)"
+    is_wsl=false
+    grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null && is_wsl=true
+
+    # In mirrored mode the distro shares the Windows network stack, so it holds
+    # a real LAN address rather than a 172.16/12 NAT one.
+    routable_ip="$(printf '%s\n' $ips | tr ' ' '\n' \
+        | grep -vE '^(172\.(1[6-9]|2[0-9]|3[01])\.|127\.|169\.254\.)' | head -1 || true)"
+
+    if [ "$is_wsl" = false ]; then
+        [ -n "${lan_ip:-}" ] && echo "cloudlogs: http://${lan_ip}:${PORT}  (LAN)"
+    elif [ -n "${routable_ip:-}" ]; then
+        echo "cloudlogs: http://${routable_ip}:${PORT}  (LAN -- WSL mirrored networking)"
+    else
+        echo "cloudlogs: from Windows use http://localhost:${PORT}"
+        host_ip=""
+        ps_exe=/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
+        if [ -x "$ps_exe" ]; then
+            host_ip="$("$ps_exe" -NoProfile -Command \
+                "(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { \$_.IPAddress -notlike '127.*' -and \$_.IPAddress -notlike '172.*' -and \$_.IPAddress -notlike '169.254.*' } | Select-Object -First 1).IPAddress" \
+                2>/dev/null | tr -d '\r\n' || true)"
+        fi
+        echo "cloudlogs: other machines on the LAN cannot reach this distro directly --"
+        echo "           WSL2 NAT puts it behind ${lan_ip:-an internal address}."
+        if [ -n "$host_ip" ]; then
+            echo "           After ./share-lan.ps1 they reach it at http://${host_ip}:${PORT}"
+        fi
+        echo "           Run in an elevated PowerShell on Windows:  .\\share-lan.ps1 -Port ${PORT}"
+        echo "           (or switch to mirrored networking -- see PLAN.md 5.1)"
     fi
 fi
 
