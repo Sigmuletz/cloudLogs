@@ -17,6 +17,19 @@ from cloudlogs.rules import RulesError
 main = pytest.importorskip("cloudlogs.main", reason="fastapi is not installed")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_cloudlogs_env(monkeypatch):
+    """Undo the environment `main()` writes.
+
+    The CLI sets CLOUDLOGS_INPUT/RULES/DATA in `os.environ` itself, which
+    monkeypatch cannot know about -- recording them here means teardown puts
+    the environment back, so one test cannot point the next at a rules file
+    that does not exist.
+    """
+    for var in ("CLOUDLOGS_INPUT", "CLOUDLOGS_RULES", "CLOUDLOGS_DATA"):
+        monkeypatch.delenv(var, raising=False)
+
+
 BROKEN = "columns:\n  - {name: level}\nrules:\n  - target: level\n    from: log\n    regex: 'oops (\\d+'\n"
 VALID = "columns:\n  - {name: level}\nrules:\n  - {target: level, from: log}\n"
 
@@ -125,3 +138,48 @@ def test_cli_rules_and_data_flags(tmp_path, monkeypatch) -> None:
     )
     assert served["rules"] == str(tmp_path / "my.yaml")
     assert served["data"] == str(tmp_path / "out.json")
+
+
+# --------------------------------------------------------------------------
+# staleness: naming a different log must re-ingest it
+# --------------------------------------------------------------------------
+
+
+def test_a_different_input_is_stale_however_old_it_is(tmp_path) -> None:
+    """A log copied off a server keeps its old mtime; it must still be ingested.
+
+    An mtime-only check said "the output is newer, nothing to do" and served
+    the PREVIOUS file's records under the new file's name.
+    """
+    from cloudlogs.ingest import ingest, is_stale
+
+    line = json.dumps({"log": "2026-07-09 08:25:06 INFO  [A.b:1] (t) hi"}) + "\n"
+    first = tmp_path / "first.log"
+    first.write_text(line, encoding="utf-8")
+    second = tmp_path / "second.log"
+    second.write_text(line * 3, encoding="utf-8")
+    os.utime(second, (0, 0))                      # older than anything we write
+
+    out = tmp_path / "logs.json"
+    ingest([first], out)
+
+    assert is_stale(out, [first]) is False        # same input, nothing changed
+    assert is_stale(out, [second]) is True        # different input, older file
+
+    summary = ingest([second], out)
+    assert summary["records"] == 3
+    assert is_stale(out, [second]) is False
+
+
+def test_the_manifest_records_what_produced_the_output(tmp_path) -> None:
+    """`ingest.json` names the files, which is what the staleness check reads."""
+    from cloudlogs.ingest import MANIFEST_NAME, ingest
+
+    source = tmp_path / "a.log"
+    source.write_text(json.dumps({"log": "x"}) + "\n", encoding="utf-8")
+    out = tmp_path / "logs.json"
+    ingest([source], out)
+
+    manifest = json.loads((tmp_path / MANIFEST_NAME).read_text(encoding="utf-8"))
+    assert manifest["inputs"] == [str(source)]
+    assert manifest["rules"].endswith(".yaml")

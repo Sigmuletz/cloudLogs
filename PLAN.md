@@ -298,8 +298,13 @@ python -m cloudlogs.ingest logs.log --rules experiments.yaml
 ```
 
 Accepts files, globs and directories; adds `source_file` per record. The server
-auto-runs ingest at startup when `data/logs.json` is missing or older than any
-input **or than `rules.yaml`**.
+auto-runs ingest at startup when `data/logs.json` is missing, older than any
+input, older than `rules.yaml` — **or produced from a different set of inputs**.
+That last test matters because a log copied off a server keeps its original
+timestamp: an mtime comparison alone would call the output "newer" and serve
+the previous file's records under the new file's name. Ingest writes
+`data/ingest.json` naming the files it read, and the staleness check compares
+against it.
 
 ---
 

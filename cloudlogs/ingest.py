@@ -61,6 +61,10 @@ from cloudlogs.rules import (
 
 DEFAULT_OUT = Path("data/logs.json")
 COLUMNS_NAME = "columns.json"
+#: written beside logs.json: which files produced it, so pointing the viewer at
+#: a DIFFERENT log re-ingests even when that log is older than the output --
+#: a file copied off a server usually is (PLAN.md 2.1)
+MANIFEST_NAME = "ingest.json"
 
 #: `facet` when a column has at most this many distinct values (PLAN.md 2.11)
 FACET_MAX_DISTINCT = 200
@@ -175,6 +179,22 @@ def is_stale(
             return True
 
     inputs = expand_inputs(paths)
+
+    # A different set of inputs is stale however old those files are: a log
+    # copied off a server keeps its original timestamp, so an mtime test alone
+    # would quietly serve the previous file's records.
+    manifest_path = out_path.with_name(MANIFEST_NAME)
+    if manifest_path.is_file():
+        try:
+            with manifest_path.open(encoding="utf-8") as handle:
+                previous = json.load(handle).get("inputs")
+        except (OSError, ValueError):
+            previous = None
+        if previous is not None and sorted(previous) != sorted(str(f) for f in inputs):
+            return True
+    elif inputs:
+        return True          # no manifest: cannot tell, so re-ingest once
+
     if not inputs:
         return False
     return any(source.stat().st_mtime > out_mtime for source in inputs)
@@ -321,6 +341,16 @@ def ingest(
         json.dump(records, handle, ensure_ascii=False)
     with columns_path.open("w", encoding="utf-8") as handle:
         json.dump(columns, handle, ensure_ascii=False, indent=2)
+    with out_path.with_name(MANIFEST_NAME).open("w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "inputs": [str(f) for f in files],
+                "rules": str(ruleset.path) if ruleset is not None else None,
+            },
+            handle,
+            ensure_ascii=False,
+            indent=2,
+        )
 
     seen: set[str] = set()
     rule_rows: list[dict[str, Any]] = []
