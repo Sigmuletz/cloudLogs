@@ -1,0 +1,6 @@
+{
+  "inputs": [
+    "/home/sigma/claude/cloudlogs/example/logs.log"
+  ],
+  "rules": "/home/sigma/claude/cloudlogs/rules.yaml"
+}

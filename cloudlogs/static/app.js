@@ -62,6 +62,15 @@ var FALLBACK_TZS = [
 
 function $(id) { return document.getElementById(id); }
 
+/* Bind a handler by element id, tolerating an element that is not there.
+   A stale cached index.html would otherwise throw on the first missing id and
+   take the rest of init() -- columns, rows, everything -- down with it. */
+function on(id, evt, fn) {
+  var n = $(id);
+  if (n) n.addEventListener(evt, fn);
+  else if (window.console) console.warn('cloudlogs: no #' + id + ' — reload the page (Ctrl+Shift+R)');
+}
+
 function el(tag, cls, txt) {
   var n = document.createElement(tag);
   if (cls) n.className = cls;
@@ -99,6 +108,12 @@ var state = {
   query: '',              // the executed Lucene query (state.lq holds the draft)
   lq: '',                 // what is typed in the query box, run or not
   sort: [],               // [{col, dir}]
+
+  files: {              // the panel's file picker (section 7d)
+    dir: '',
+    current: '',        // name of the file whose records are loaded
+    list: []
+  },
 
   rows: [],
   total: 0,
@@ -934,6 +949,168 @@ function installQueryBar() {
   $('lq-run').addEventListener('click', runQuery);
   $('lq-clear').addEventListener('click', clearQuery);
   $('lq-help').addEventListener('click', function (e) { openQueryHelp(e.currentTarget); });
+}
+
+
+/* ── 7d. file picker ─────────────────────────────────────────────────────
+   The panel head picks which log file the viewer is looking at. The server
+   lists the folder the current input lives in (GET /api/files); picking one
+   posts it to /api/select, which drops the loaded records and ingests the new
+   file. A different file means different columns, so everything tied to the
+   old one — filters, query, sort, highlights, the drawer — is cleared here
+   before the new column metadata lands.
+   -------------------------------------------------------------------- */
+
+function humanSize(n) {
+  if (typeof n !== 'number' || n < 0) return '';
+  if (n < 1024) return n + ' B';
+  var units = ['KB', 'MB', 'GB', 'TB'], v = n / 1024, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return (v >= 10 ? Math.round(v) : Math.round(v * 10) / 10) + ' ' + units[i];
+}
+
+function renderFileButton() {
+  var btn = $('file-btn');
+  if (!btn) return;
+  var name = state.files.current;
+  btn.textContent = (name || 'pick a log file') + ' ▾';
+  btn.title = state.files.dir
+    ? (name ? name + ' — ' + state.files.dir : 'no file loaded — ' + state.files.dir)
+    : 'Pick a log file from this folder';
+}
+
+async function loadFiles() {
+  try {
+    var data = await api('/api/files');
+  } catch (e) {
+    state.files.list = [];
+    renderFileButton();
+    throw e;
+  }
+  state.files.dir = data.dir || '';
+  state.files.list = Array.isArray(data.files) ? data.files : [];
+  var cur = state.files.list.filter(function (f) { return f.current; });
+  state.files.current = data.current_name || (cur.length === 1 ? cur[0].name : '');
+  renderFileButton();
+  return data;
+}
+
+function openFilePicker(anchor) {
+  // refetch first: files land in that folder while the viewer is open
+  loadFiles().catch(function (e) {
+    showError('Could not list log files: ' + (e.message || e));
+  }).then(function () {
+    openPop({
+      anchor: anchor,
+      search: 'filter files…',
+      items: function () {
+        if (!state.files.list.length) {
+          return [{ label: 'no log files in ' + (state.files.dir || 'this folder'), disabled: true, onPick: function () {} }];
+        }
+        return state.files.list.map(function (f) {
+          return {
+            label: f.name,
+            sub: (f.current ? '✓ ' : '') + humanSize(f.size),
+            onPick: function () { selectFile(f); }
+          };
+        });
+      }
+    });
+  });
+}
+
+/* Everything that describes the file being viewed, dropped in one place. */
+function resetForNewFile() {
+  state.filters = {};
+  state.highlights = {};
+  state.facetSearch = {};
+  state.q = '';
+  state.query = '';
+  state.lq = '';
+  state.sort = [];
+  state.rows = [];
+  state.total = 0;
+  state.grandTotal = null;
+  state.facets = {};
+  state.selectedRow = null;
+  state.done = false;
+  state.gen++;                       // in-flight pages belong to the old file
+  if (drawerOpen()) closeDrawer();
+  var ta = $('lq');
+  if (ta) ta.value = '';
+  clearQueryError();
+  markQueryDirty();
+  clearError();
+  writeHash();
+}
+
+async function selectFile(file) {
+  if (file.current && state.files.current === file.name) { return; }
+  setBusy(true);
+  clearError();
+  try {
+    await api('/api/select', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: file.path })
+    });
+  } catch (e) {
+    setBusy(false);
+    showError('Could not load ' + file.name + ': ' + (e.message || e));
+    // the server cleared its records either way; show that, do not lie
+    resetForNewFile();
+    state.files.current = '';
+    renderFileButton();
+    await loadWorkspace(false);
+    return;
+  }
+  resetForNewFile();
+  state.files.current = file.name;
+  state.files.list.forEach(function (f) { f.current = (f.path === file.path); });
+  renderFileButton();
+  setBusy(false);
+  await loadWorkspace(false);
+}
+
+/* Load column metadata, rebuild the layout and fetch the first page.
+   `useHash` replays the filters in the location hash (page load only). */
+async function loadWorkspace(useHash) {
+  try {
+    var cols = await api('/api/columns');
+    state.columns = normalizeColumns(cols);
+    clearError();
+  } catch (e) {
+    showError('Could not load /api/columns: ' + (e.message || e));
+    state.columns = [];
+  }
+  state.colMap = {};
+  state.columns.forEach(function (c) { state.colMap[c.name] = c; });
+
+  applyDefaultLayout();
+  saveLayout();
+
+  // panel opens with the default_filter columns (falling back to the plan's list)
+  var panel = state.columns.filter(function (c) { return c.default_filter; }).map(function (c) { return c.name; });
+  if (!panel.length) panel = DEFAULT_PANEL.filter(function (n) { return state.colMap[n]; });
+  state.panel = panel;
+
+  if (useHash) {
+    state.lastHash = window.location.hash || '';
+    applyHashState();
+  }
+
+  renderHeader();
+  renderPanel();
+  renderHighlightBar();
+
+  // baseline (unfiltered) count for the "N of M matching" header
+  try {
+    var base = await postLogs({ filters: {}, q: '', sort: [], limit: 1, offset: 0 });
+    if (typeof base.total === 'number') state.grandTotal = base.total;
+  } catch (e) { /* non-fatal */ }
+
+  $('tablewrap').scrollTop = 0;
+  await fetchPage(0, false);
 }
 
 
@@ -2006,21 +2183,20 @@ function setPanelCollapsed(v) {
 }
 
 function installGlobalHandlers() {
-  $('panel-hide').addEventListener('click', function () { setPanelCollapsed(true); });
-  $('panel-show').addEventListener('click', function () { setPanelCollapsed(false); });
-  $('add-filter').addEventListener('click', function (e) { openAddFilter(e.currentTarget); });
-  $('cols-btn').addEventListener('click', function (e) { openColumnsPicker(e.currentTarget); });
-  $('tz-btn').addEventListener('click', function (e) { openTzPicker(e.currentTarget); });
-  $('reload').addEventListener('click', function () { state.grandTotal = null; refresh(); });
-  $('drawer-close').addEventListener('click', closeDrawer);
-  $('reset-layout').addEventListener('click', resetLayout);
-  $('clear-filters').addEventListener('click', function () {
+  on('panel-hide', 'click', function () { setPanelCollapsed(true); });
+  on('panel-show', 'click', function () { setPanelCollapsed(false); });
+  on('add-filter', 'click', function (e) { openAddFilter(e.currentTarget); });
+  on('cols-btn', 'click', function (e) { openColumnsPicker(e.currentTarget); });
+  on('tz-btn', 'click', function (e) { openTzPicker(e.currentTarget); });
+  on('reload', 'click', function () { state.grandTotal = null; refresh(); });
+  on('drawer-close', 'click', closeDrawer);
+  on('reset-layout', 'click', resetLayout);
+  on('clear-filters', 'click', function () {
     state.filters = {};
     state.highlights = {};          // the button clears every selection...
     state.q = '';
     state.query = '';               // ...including the query box
     state.lq = '';
-    $('q').value = '';
     if ($('lq')) $('lq').value = '';
     clearQueryError();
     markQueryDirty();
@@ -2029,10 +2205,7 @@ function installGlobalHandlers() {
     commitFilters();
   });
 
-  $('q').addEventListener('input', debounce(function () {
-    state.q = $('q').value;
-    commitFilters();
-  }, DEBOUNCE_MS));
+  on('file-btn', 'click', function (e) { openFilePicker(e.currentTarget); });
 
   var wrap = $('tablewrap');
   wrap.addEventListener('scroll', function () {
@@ -2092,45 +2265,37 @@ function installGlobalHandlers() {
   installQueryBar();
 }
 
+/* Anything thrown in here used to leave a blank page and no explanation.
+   Say what broke, on the page, where it cannot be missed. */
 async function init() {
+  try {
+    await boot();
+  } catch (e) {
+    var msg = (e && (e.stack || e.message)) || String(e);
+    if (window.console) console.error('cloudlogs: init failed', e);
+    try {
+      showError('The viewer failed to start: ' + msg +
+        '\n\nA stale cached script is the usual cause — reload with Ctrl+Shift+R.');
+    } catch (ignored) {
+      document.body.textContent = 'cloudlogs failed to start: ' + msg;
+    }
+  }
+}
+
+async function boot() {
   loadLayout();
   applyPanelCollapsed();
   applyPanelWidths();
   renderTzButton();
+  renderFileButton();
   installGlobalHandlers();
 
+  // which file is loaded, before the data that came out of it
   try {
-    var cols = await api('/api/columns');
-    state.columns = normalizeColumns(cols);
-  } catch (e) {
-    showError('Could not load /api/columns: ' + (e.message || e));
-    state.columns = [];
-  }
-  state.colMap = {};
-  state.columns.forEach(function (c) { state.colMap[c.name] = c; });
+    await loadFiles();
+  } catch (e) { /* non-fatal: the picker just opens empty */ }
 
-  applyDefaultLayout();
-  saveLayout();
-
-  // panel opens with the default_filter columns (falling back to the plan's list)
-  var panel = state.columns.filter(function (c) { return c.default_filter; }).map(function (c) { return c.name; });
-  if (!panel.length) panel = DEFAULT_PANEL.filter(function (n) { return state.colMap[n]; });
-  state.panel = panel;
-
-  state.lastHash = window.location.hash || '';
-  applyHashState();
-
-  renderHeader();
-  renderPanel();
-  renderHighlightBar();
-
-  // baseline (unfiltered) count for the "N of M matching" header
-  try {
-    var base = await postLogs({ filters: {}, q: '', sort: [], limit: 1, offset: 0 });
-    if (typeof base.total === 'number') state.grandTotal = base.total;
-  } catch (e) { /* non-fatal */ }
-
-  await fetchPage(0, false);
+  await loadWorkspace(true);
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
