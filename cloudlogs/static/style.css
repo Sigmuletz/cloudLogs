@@ -102,6 +102,16 @@ body.panel-collapsed #panel-show { display: inline-block; }
 }
 .panel-head .input { flex: 1; min-width: 0; }
 
+/* the file picker fills the panel head; a long name is clipped, not wrapped */
+.file-btn {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .panel-actions {
   display: flex;
   align-items: center;

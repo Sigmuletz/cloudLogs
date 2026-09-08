@@ -57,7 +57,7 @@ from pathlib import Path
 from typing import Any, Literal, Sequence
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -93,6 +93,9 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 DEFAULT_INPUT = "example/logs.log"
 DEFAULT_DATA = "data/logs.json"
 
+#: suffixes the file picker offers (rotated `app.log.1` is matched by name)
+LOG_SUFFIXES = {".log", ".txt", ".json", ".jsonl", ".ndjson", ".out"}
+
 FACET_DISTINCT_CAP = 200  # PLAN.md 2.6: a column is facet-kind at <= 200 distinct
 MAX_FACET_VALUES = 1000  # hard cap on values returned per facet column
 
@@ -123,6 +126,99 @@ def input_paths() -> list[str]:
 def data_path() -> Path:
     path = Path(os.environ.get("CLOUDLOGS_DATA", DEFAULT_DATA))
     return path if path.is_absolute() else BASE_DIR / path
+
+
+def current_dir() -> Path:
+    """The folder the file picker lists: where the selected log file lives.
+
+    The inputs may be files, globs or directories, so the folder is taken from
+    the first one that resolves to something real -- a directory input is its
+    own folder, a file input is its parent. With nothing resolvable (a typo, a
+    deleted file) the project root is the honest fallback: it is where the
+    default input lives.
+    """
+    for raw in input_paths():
+        path = Path(raw)
+        if path.is_dir():
+            return path.resolve()
+        if path.is_file():
+            return path.resolve().parent
+    for raw in input_paths():           # a glob, or a path that no longer exists
+        parent = Path(raw).parent
+        if parent.is_dir():
+            return parent.resolve()
+    return BASE_DIR
+
+
+def _is_log_file(path: Path) -> bool:
+    """Files worth offering in the picker: log-ish suffixes, no dotfiles.
+
+    ``app.log.1`` and ``app.log.2026-07-09`` are rotated logs and belong in the
+    list, so ``.log`` anywhere in the name counts, not only as the suffix.
+    """
+    if path.name.startswith("."):
+        return False
+    if path.suffix.lower() in LOG_SUFFIXES:
+        return True
+    return ".log." in path.name.lower()
+
+
+def list_log_files(folder: Path) -> list[dict[str, Any]]:
+    """Log files directly in ``folder`` (no recursion), newest first."""
+    try:
+        entries = [p for p in folder.iterdir() if p.is_file() and _is_log_file(p)]
+    except OSError as exc:
+        print(f"cloudlogs: cannot list {folder} ({exc})")
+        return []
+    current = {p.resolve() for p in _resolved_inputs()}
+    files: list[dict[str, Any]] = []
+    for path in entries:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        files.append(
+            {
+                "name": path.name,
+                "path": str(path.resolve()),
+                "size": stat.st_size,
+                "mtime": stat.st_mtime,
+                "current": path.resolve() in current,
+            }
+        )
+    files.sort(key=lambda f: (-f["mtime"], f["name"].lower()))
+    return files
+
+
+def _resolved_inputs() -> list[Path]:
+    """The input paths that exist right now, files only."""
+    out: list[Path] = []
+    for raw in input_paths():
+        path = Path(raw)
+        if path.is_file():
+            out.append(path)
+    return out
+
+
+def clear_data(out: Path) -> None:
+    """Drop the previous file's records so a failed ingest cannot serve them.
+
+    Both the in-memory state and the generated files go: ``load_state`` would
+    otherwise fall back to a stale ``logs.json``/``columns.json`` pair that
+    describes a log nobody selected any more.
+    """
+    global RECORDS, COLUMNS
+    RECORDS = []
+    COLUMNS = []
+    _index_columns()
+    for name in (out.name, "columns.json", "ingest.json"):
+        target = out.with_name(name)
+        try:
+            target.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(f"cloudlogs: could not remove {target} ({exc})")
 
 
 def _infer_columns(records: list[dict]) -> list[dict]:
@@ -271,9 +367,26 @@ async def lifespan(_app: FastAPI):
     yield
 
 
+class RevalidatingStatic(StaticFiles):
+    """Static files the browser must revalidate instead of reusing blindly.
+
+    ``index.html`` and ``app.js`` change together: a browser that serves one
+    from cache and the other from the server runs a page whose elements the
+    script does not know about, and the viewer comes up blank. ``no-cache``
+    still allows the 304 round-trip, so nothing is re-downloaded needlessly.
+    """
+
+    def file_response(self, *args: Any, **kwargs: Any):  # type: ignore[override]
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 app = FastAPI(title="cloudlogs", version="0.1.0", lifespan=lifespan)
 # check_dir=False: index.html/app.js may not exist yet while the UI is built.
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR), check_dir=False), name="static")
+app.mount(
+    "/static", RevalidatingStatic(directory=str(STATIC_DIR), check_dir=False), name="static"
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -408,6 +521,80 @@ def api_row(idx: int) -> dict:
     return RECORDS[idx]
 
 
+@app.get("/api/files")
+def api_files() -> dict:
+    """Log files sitting next to the selected one, for the panel's picker."""
+    folder = current_dir()
+    current = [str(p.resolve()) for p in _resolved_inputs()]
+    return {
+        "dir": str(folder),
+        "current": current,
+        "current_name": Path(current[0]).name if len(current) == 1 else "",
+        "files": list_log_files(folder),
+    }
+
+
+class SelectFileRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    path: str
+
+
+@app.post("/api/select")
+def api_select(req: SelectFileRequest) -> dict:
+    """Switch to one log file: clear the loaded one, then ingest and parse it.
+
+    Only files in :func:`current_dir` are accepted -- the picker lists that one
+    folder, and the server has no business opening whatever path a request
+    names.
+    """
+    folder = current_dir()
+    target = Path(req.path)
+    if not target.is_absolute():
+        target = folder / target
+    try:
+        target = target.resolve()
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"bad path: {exc}") from exc
+
+    if target.parent != folder:
+        raise HTTPException(
+            status_code=400, detail=f"{target} is not in {folder}"
+        )
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail=f"no such file: {target}")
+
+    previous = os.environ.get("CLOUDLOGS_INPUT")
+    os.environ["CLOUDLOGS_INPUT"] = str(target)
+    clear_data(data_path())
+    try:
+        summary = load_state(force_ingest=True)
+    except RulesError as exc:
+        _restore_input(previous)
+        raise HTTPException(
+            status_code=400, detail={"error": str(exc), "kind": "rules"}
+        ) from exc
+    except Exception as exc:
+        _restore_input(previous)
+        raise HTTPException(status_code=500, detail=f"ingest failed: {exc}") from exc
+    summary["file"] = str(target)
+    summary["file_name"] = target.name
+    return summary
+
+
+def _restore_input(previous: str | None) -> None:
+    """Put ``CLOUDLOGS_INPUT`` back after a failed switch.
+
+    The records are gone either way -- ``clear_data`` ran -- but leaving the
+    environment pointing at a file that cannot be ingested would make every
+    later reload fail too.
+    """
+    if previous is None:
+        os.environ.pop("CLOUDLOGS_INPUT", None)
+    else:
+        os.environ["CLOUDLOGS_INPUT"] = previous
+
+
 @app.post("/api/reload")
 def api_reload() -> dict:
     """Re-run ingest (forced) and reload ``RECORDS`` without a restart."""
@@ -425,11 +612,39 @@ def api_reload() -> dict:
         raise HTTPException(status_code=500, detail=f"reload failed: {exc}") from exc
 
 
+def _versioned_index(page: Path) -> str:
+    """``index.html`` with ``?v=<mtime>`` on the stylesheet and the script.
+
+    Revalidation headers are not enough on their own: with no ``max-age`` a
+    browser is free to reuse a stored response *without asking*, so a page
+    edited here can meet an ``app.js`` cached before the edit. The two are one
+    unit -- the script binds elements the page declares -- and a mismatch
+    throws on the first missing id and leaves the viewer blank. A query string
+    that changes with the file makes the stale copy unaddressable.
+    """
+    html = page.read_text(encoding="utf-8")
+
+    def stamp(name: str) -> str:
+        target = STATIC_DIR / name
+        try:
+            return f"{name}?v={int(target.stat().st_mtime)}"
+        except OSError:
+            return name
+
+    for asset in ("style.css", "app.js"):
+        stamped = stamp(asset)
+        html = html.replace(f'"static/{asset}"', f'"static/{stamped}"')
+        html = html.replace(f"'{asset}'", f"'{stamped}'")   # the onerror fallbacks
+    return html
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> Any:
     page = STATIC_DIR / "index.html"
     if page.exists():
-        return FileResponse(page)
+        return HTMLResponse(
+            _versioned_index(page), headers={"Cache-Control": "no-cache"}
+        )
     return HTMLResponse(
         "<h1>cloudlogs</h1><p>static/index.html is not there yet. "
         'The API is up: <code>POST /api/logs</code>, <code>GET /api/columns</code>.</p>',
