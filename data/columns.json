@@ -46,7 +46,7 @@
   },
   {
     "name": "src_line",
-    "kind": "number",
+    "kind": "facet",
     "label": "Source Line",
     "distinct": 68,
     "numeric": true,
@@ -64,7 +64,7 @@
   },
   {
     "name": "message",
-    "kind": "text",
+    "kind": "facet",
     "label": "Message",
     "distinct": 286,
     "numeric": false,
@@ -75,7 +75,7 @@
     "name": "service",
     "kind": "facet",
     "label": "Service",
-    "distinct": 5,
+    "distinct": 0,
     "numeric": false,
     "default_visible": true,
     "default_filter": true
@@ -100,7 +100,7 @@
   },
   {
     "name": "req_duration_ms",
-    "kind": "number",
+    "kind": "facet",
     "label": "Req Duration (ms)",
     "distinct": 42,
     "numeric": true,
@@ -129,7 +129,7 @@
     "name": "req_x_header",
     "kind": "facet",
     "label": "Req X-Forwarded-For",
-    "distinct": 1,
+    "distinct": 0,
     "numeric": false,
     "default_visible": false,
     "default_filter": false
@@ -138,7 +138,7 @@
     "name": "req_trace_ids",
     "kind": "facet",
     "label": "Req Trace-IDs",
-    "distinct": 67,
+    "distinct": 0,
     "numeric": false,
     "default_visible": false,
     "default_filter": false
@@ -147,7 +147,7 @@
     "name": "op_x_request_id",
     "kind": "facet",
     "label": "X-Request-ID",
-    "distinct": 1,
+    "distinct": 0,
     "numeric": false,
     "default_visible": false,
     "default_filter": false
@@ -174,7 +174,7 @@
     "name": "k8s_pod",
     "kind": "facet",
     "label": "K8s Pod",
-    "distinct": 44,
+    "distinct": 0,
     "numeric": false,
     "default_visible": false,
     "default_filter": false
@@ -201,7 +201,7 @@
     "name": "k8s_version",
     "kind": "facet",
     "label": "K8s Version",
-    "distinct": 2,
+    "distinct": 0,
     "numeric": false,
     "default_visible": false,
     "default_filter": false
@@ -255,7 +255,7 @@
     "name": "has_response_payload",
     "kind": "facet",
     "label": "Has Response Payload",
-    "distinct": 2,
+    "distinct": 0,
     "numeric": false,
     "default_visible": false,
     "default_filter": false
@@ -264,7 +264,7 @@
     "name": "source_file",
     "kind": "facet",
     "label": "Source File",
-    "distinct": 1,
+    "distinct": 0,
     "numeric": false,
     "default_visible": false,
     "default_filter": false
